@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>直播切片工作台</title>
+    <style>
+      #direct-open-warning[hidden] { display: none; }
+      #direct-open-warning { min-height: 100vh; display: grid; place-items: center; padding: 32px; background: #0d0f12; color: #f4f6f8; font-family: "Microsoft YaHei", system-ui, sans-serif; }
+      #direct-open-warning .card { width: min(620px, 92vw); padding: 42px; border: 1px solid #30363f; border-radius: 20px; background: #171a1f; box-shadow: 0 24px 80px rgba(0,0,0,.45); }
+      #direct-open-warning .mark { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 14px; background: #d7ff46; color: #111; font-size: 26px; }
+      #direct-open-warning h1 { margin: 24px 0 12px; font-size: 28px; }
+      #direct-open-warning p { color: #9aa3ae; line-height: 1.8; }
+      #direct-open-warning a { display: inline-flex; margin-top: 16px; padding: 12px 20px; border-radius: 10px; color: #111; background: #d7ff46; font-weight: 700; text-decoration: none; }
+      #direct-open-warning small { display: block; margin-top: 18px; color: #69727e; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="direct-open-warning">
+      <div class="card">
+        <div class="mark">✦</div>
+        <h1>请运行桌面应用</h1>
+        <p>请在项目目录运行 npm ci 和 npm run dev。具体步骤见 README。</p>
+      </div>
+    </div>
+    <script type="module" src="/src/renderer/main.tsx"></script>
+  </body>
+</html>
