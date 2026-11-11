@@ -117,14 +117,31 @@ jobs:
           社区版使用 GitHub Releases 检查更新。收到提醒后可在应用内下载并打开 DMG。
           Mac 安装包未做 Apple Developer ID 签名或公证。
           EOF
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --draft --title "直播切片工作台 $version · macOS" --notes-file release-notes.md \
-            "$arm#Apple 芯片 (ARM64)" "$intel#Intel 芯片 (x64)"
+          releases="repos/$GITHUB_REPOSITORY/releases"
+          find_release_id() {
+            gh api --paginate "$releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id"
+          }
+          release_id="$(find_release_id)"
+          if [ -z "$release_id" ]; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --title "直播切片工作台 $version · macOS" --notes-file release-notes.md
+            release_id="$(find_release_id)"
+          fi
+          test -n "$release_id"
+          release="$releases/$release_id"
           for file in "$arm" "$intel"; do
             name="$(basename "$file")"
             checksum="$(sha256sum "$file" | cut -d' ' -f1)"
-            actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-              --jq ".assets[] | select(.name == \"$name\" and .state == \"uploaded\") | .digest")"
+            asset_filter=".[] | select(.name == \"$name\")"
+            existing="$(gh api "$release/assets" --jq "$asset_filter | .id")"
+            if [ -z "$existing" ]; then
+              test "$(gh api "$release" --jq .draft)" = true
+              gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "$file"
+            fi
+            actual="$(gh api "$release/assets" --jq "$asset_filter | select(.state == \"uploaded\") | .digest")"
             test "$actual" = "sha256:$checksum"
           done
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          if [ "$(gh api "$release" --jq .draft)" = true ]; then
+            gh api --method PATCH "$release" -F draft=false -f make_latest=true --jq .html_url
+          fi
