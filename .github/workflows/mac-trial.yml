@@ -1,0 +1,68 @@
+name: Mac trial build
+
+on:
+  push:
+    branches: [mac-trial-build]
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Build trial disk image
+        run: |
+          set -euo pipefail
+          npm ci
+          test "$(node -p process.arch)" = "$TARGET_ARCH"
+          npm run build
+          npx --no-install electron-builder --mac dmg --"$TARGET_ARCH" --publish never
+      - name: Verify disk image and launch the packaged app
+        run: |
+          set -euo pipefail
+          dmg=(release/*-mac-"$TARGET_ARCH".dmg)
+          test "${#dmg[@]}" = 1
+          hdiutil verify "${dmg[0]}"
+          mount_dir="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "${dmg[0]}"
+          trap 'hdiutil detach "$mount_dir"' EXIT
+          app=("$mount_dir"/*.app)
+          test "${#app[@]}" = 1
+          executable="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "${app[0]}/Contents/Info.plist")"
+          resources="${app[0]}/Contents/Resources/app.asar.unpacked/node_modules"
+          "$resources/ffmpeg-static/ffmpeg" -version
+          "$resources/ffprobe-static/bin/darwin/$TARGET_ARCH/ffprobe" -version
+          python3 -c 'import subprocess,sys; p=subprocess.run([sys.argv[1], "--smoke-test", "--screenshot=release/mac-smoke.png"], capture_output=True, text=True, timeout=45); print(p.stdout); print(p.stderr, file=sys.stderr); sys.exit(0 if p.returncode == 0 and "SMOKE_TEST_READY" in p.stdout else 1)' "${app[0]}/Contents/MacOS/$executable"
+          test -s release/mac-smoke.png
+          (cd release && shasum -a 256 *-mac-"$TARGET_ARCH".dmg > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mac-trial-${{ matrix.arch }}
+          path: |
+            release/*-mac-${{ matrix.arch }}.dmg
+            release/SHA256SUMS.txt
+            release/mac-smoke.png
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
