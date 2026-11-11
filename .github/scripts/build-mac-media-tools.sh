@@ -44,7 +44,7 @@ fetch ffmpeg https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
 )
 meson setup "$build_dir/harfbuzz-build" "$build_dir/harfbuzz" \
   --prefix="$prefix" --libdir=lib --buildtype=release --default-library=static \
-  -Dauto_features=disabled -Dtests=disabled -Ddocs=disabled
+  -Dauto_features=disabled -Dfreetype=enabled -Dtests=disabled -Ddocs=disabled
 meson compile -C "$build_dir/harfbuzz-build" -j "$jobs"
 meson install -C "$build_dir/harfbuzz-build"
 (
