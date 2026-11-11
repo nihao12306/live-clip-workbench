@@ -11,7 +11,7 @@ jobs:
   mac:
     name: macOS ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +34,11 @@ jobs:
       - name: Build trial disk image
         run: |
           set -euo pipefail
-          npm ci
+          FFMPEG_BIN=/usr/bin/true npm ci
+          for tool in meson ninja nasm pkg-config; do
+            command -v "$tool" >/dev/null || brew install "$tool"
+          done
+          bash .github/scripts/build-mac-media-tools.sh
           test "$(node -p process.arch)" = "$TARGET_ARCH"
           npm run build
           npx --no-install electron-builder --mac dmg --"$TARGET_ARCH" --publish never
@@ -51,8 +55,22 @@ jobs:
           test "${#app[@]}" = 1
           executable="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "${app[0]}/Contents/Info.plist")"
           resources="${app[0]}/Contents/Resources/app.asar.unpacked/node_modules"
-          "$resources/ffmpeg-static/ffmpeg" -version
-          "$resources/ffprobe-static/bin/darwin/$TARGET_ARCH/ffprobe" -version
+          native_arch="$TARGET_ARCH"
+          if [ "$native_arch" = x64 ]; then native_arch=x86_64; fi
+          ffmpeg="$resources/ffmpeg-static/ffmpeg"
+          ffprobe="$resources/ffprobe-static/bin/darwin/$TARGET_ARCH/ffprobe"
+          for tool in "$ffmpeg" "$ffprobe"; do
+            test "$(lipo -archs "$tool")" = "$native_arch"
+            "$tool" -buildconf > release/media-build.txt 2>&1
+            if grep -q -- '--enable-nonfree' release/media-build.txt; then exit 1; fi
+            otool -L "$tool" | tail -n +2 | awk '$1 !~ /^\/(usr\/lib|System\/Library)\// { bad = 1 } END { exit bad }'
+          done
+          test -s "$resources/../media-tools/ffmpeg-corresponding-source.tar.gz"
+          "$ffmpeg" -v error -f lavfi -i color=size=160x120:rate=25 -t 1 -c:v libx264 release/media-test.mp4
+          "$ffprobe" -v error -show_entries stream=codec_name -of csv=p=0 release/media-test.mp4 | grep -qx h264
+          "$ffmpeg" -filters > release/media-filters.txt 2>&1
+          grep -qw subtitles release/media-filters.txt
+          grep -qw drawtext release/media-filters.txt
           python3 -c 'import subprocess,sys; p=subprocess.run([sys.argv[1], "--smoke-test", "--screenshot=release/mac-smoke.png"], capture_output=True, text=True, timeout=45); print(p.stdout); print(p.stderr, file=sys.stderr); sys.exit(0 if p.returncode == 0 and "SMOKE_TEST_READY" in p.stdout else 1)' "${app[0]}/Contents/MacOS/$executable"
           test -s release/mac-smoke.png
           (cd release && shasum -a 256 *-mac-"$TARGET_ARCH".dmg > SHA256SUMS.txt)
