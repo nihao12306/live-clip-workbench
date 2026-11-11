@@ -59,6 +59,7 @@ import { prepareCandidateSubtitleSync } from "../shared/subtitle-sync";
 import { assessSelectionPrinciples, assertSelectionPrinciples } from "./selection-principles";
 import { assessContentDensity, assertContentDensity } from "./content-density";
 import {
+  compareVersions,
   selectUpdateInstaller,
   selectUpdateRelease,
   type UpdateChunk,
@@ -66,6 +67,7 @@ import {
   type UpdateRelease,
   type UpdateManifest,
 } from "../shared/update";
+import { checkGithubUpdate, downloadGithubUpdate } from "./github-update";
 import {
   buildUpdateManifest,
   selectReleaseArtifacts,
@@ -363,15 +365,6 @@ function assertCandidateSelection(
   );
 }
 
-function compareVersions(left: string, right: string): number {
-  const a = left.split(".").map((part) => Number(part) || 0);
-  const b = right.split(".").map((part) => Number(part) || 0);
-  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
-    if ((a[index] ?? 0) !== (b[index] ?? 0)) return (a[index] ?? 0) - (b[index] ?? 0);
-  }
-  return 0;
-}
-
 function feishuFileTimestamp(file: FeishuDriveFile): number {
   const raw = Number(file.modifiedTime ?? file.createdTime ?? 0);
   return Number.isFinite(raw) ? raw : 0;
@@ -537,13 +530,8 @@ async function readUpdateInfo(): Promise<UpdateInfo> {
     ? path.join(currentSettings.feishuSyncPath, "直播切片工作台更新", "latest.json")
     : "");
   if (!manifestPath) {
-    return {
-      currentVersion,
-      platform,
-      source: "local",
-      available: false,
-      message: "未配置更新清单；可将 latest.json 放入飞书同步目录的“直播切片工作台更新”文件夹",
-    };
+    const update = await checkGithubUpdate(currentVersion, platform, process.arch, (url, init) => net.fetch(url, init));
+    return update.info;
   }
   try {
     const raw = JSON.parse(await fs.readFile(manifestPath, "utf8")) as UpdateManifest;
@@ -709,6 +697,21 @@ async function uploadFeishuReleaseArtifact(
     files,
     tokens: uploadedTokens,
   };
+}
+
+async function downloadGithubInstaller(assetId: number): Promise<string> {
+  const platform = process.platform;
+  if (platform !== "darwin" && platform !== "win32") throw new Error("当前系统不支持安装更新");
+
+  const update = await checkGithubUpdate(app.getVersion(), platform, process.arch, (url, init) => net.fetch(url, init));
+  if (!update.download || update.info.githubAssetId !== assetId) {
+    throw new Error(update.download ? "GitHub 版本已变化，请重新检查更新" : update.info.message);
+  }
+  return downloadGithubUpdate(
+    update.download,
+    path.join(app.getPath("userData"), "updates"),
+    (url, init) => net.fetch(url, init),
+  );
 }
 
 async function downloadAndAssembleFeishuUpdate(
@@ -1498,7 +1501,9 @@ function registerIpc(): void {
   );
   ipcMain.handle("updates:install", async (_event, request: UpdateInstallRequest) => {
     let installerPath = request?.installerPath?.trim() || "";
-    if (!installerPath && request?.feishuFileChunks?.length) {
+    if (request?.githubAssetId !== undefined) {
+      installerPath = await downloadGithubInstaller(request.githubAssetId);
+    } else if (!installerPath && request?.feishuFileChunks?.length) {
       const installerFileName = request.installerFileName?.trim() || "";
       installerPath = await downloadAndAssembleFeishuUpdate(
         request.feishuFileChunks,

@@ -1,0 +1,130 @@
+name: Publish Mac installers
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Build disk image
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
+          FFMPEG_BIN=/usr/bin/true npm ci
+          for tool in meson ninja nasm pkg-config; do
+            command -v "$tool" >/dev/null || brew install "$tool"
+          done
+          bash .github/scripts/build-mac-media-tools.sh
+          test "$(node -p process.arch)" = "$TARGET_ARCH"
+          npm run build
+          npx --no-install electron-builder --mac dmg --"$TARGET_ARCH" --publish never
+      - name: Verify disk image and launch the packaged app
+        run: |
+          set -euo pipefail
+          dmg=(release/*-mac-"$TARGET_ARCH".dmg)
+          test "${#dmg[@]}" = 1
+          hdiutil verify "${dmg[0]}"
+          mount_dir="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "${dmg[0]}"
+          trap 'hdiutil detach "$mount_dir"' EXIT
+          app=("$mount_dir"/*.app)
+          test "${#app[@]}" = 1
+          executable="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "${app[0]}/Contents/Info.plist")"
+          resources="${app[0]}/Contents/Resources/app.asar.unpacked/node_modules"
+          native_arch="$TARGET_ARCH"
+          if [ "$native_arch" = x64 ]; then native_arch=x86_64; fi
+          ffmpeg="$resources/ffmpeg-static/ffmpeg"
+          ffprobe="$resources/ffprobe-static/bin/darwin/$TARGET_ARCH/ffprobe"
+          for tool in "$ffmpeg" "$ffprobe"; do
+            test "$(lipo -archs "$tool")" = "$native_arch"
+            "$tool" -buildconf > release/media-build.txt 2>&1
+            if grep -q -- '--enable-nonfree' release/media-build.txt; then exit 1; fi
+            otool -L "$tool" | tail -n +2 | awk '$1 !~ /^\/(usr\/lib|System\/Library)\// { bad = 1 } END { exit bad }'
+          done
+          test -s "$resources/../media-tools/ffmpeg-corresponding-source.tar.gz"
+          "$ffmpeg" -v error -f lavfi -i color=size=160x120:rate=25 -t 1 -c:v libx264 release/media-test.mp4
+          "$ffprobe" -v error -show_entries stream=codec_name -of csv=p=0 release/media-test.mp4 | grep -qx h264
+          "$ffmpeg" -filters > release/media-filters.txt 2>&1
+          grep -qw subtitles release/media-filters.txt
+          grep -qw drawtext release/media-filters.txt
+          python3 -c 'import subprocess,sys; p=subprocess.run([sys.argv[1], "--smoke-test", "--screenshot=release/mac-smoke.png"], capture_output=True, text=True, timeout=45); print(p.stdout); print(p.stderr, file=sys.stderr); sys.exit(0 if p.returncode == 0 and "SMOKE_TEST_READY" in p.stdout else 1)' "${app[0]}/Contents/MacOS/$executable"
+          test -s release/mac-smoke.png
+          (cd release && shasum -a 256 *-mac-"$TARGET_ARCH".dmg > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mac-release-${{ matrix.arch }}
+          path: |
+            release/*-mac-${{ matrix.arch }}.dmg
+            release/SHA256SUMS.txt
+            release/mac-smoke.png
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Publish verified Mac installers
+    needs: mac
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: packages
+          pattern: mac-release-*
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          prefix="live-clip-workbench-$version-mac"
+          arm="packages/mac-release-arm64/$prefix-arm64.dmg"
+          intel="packages/mac-release-x64/$prefix-x64.dmg"
+          for directory in packages/mac-release-arm64 packages/mac-release-x64; do
+            (cd "$directory" && sha256sum -c SHA256SUMS.txt)
+          done
+          cat > release-notes.md <<'EOF'
+          下载对应芯片的 DMG，打开后将工作台拖入「应用程序」。
+          - Apple 芯片（M 系列）选 arm64。
+          - Intel 芯片选 x64。
+
+          社区版使用 GitHub Releases 检查更新。收到提醒后可在应用内下载并打开 DMG。
+          Mac 安装包未做 Apple Developer ID 签名或公证。
+          EOF
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --draft --title "直播切片工作台 $version · macOS" --notes-file release-notes.md \
+            "$arm#Apple 芯片 (ARM64)" "$intel#Intel 芯片 (x64)"
+          for file in "$arm" "$intel"; do
+            name="$(basename "$file")"
+            checksum="$(sha256sum "$file" | cut -d' ' -f1)"
+            actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq ".assets[] | select(.name == \"$name\" and .state == \"uploaded\") | .digest")"
+            test "$actual" = "sha256:$checksum"
+          done
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

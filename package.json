@@ -1,6 +1,6 @@
 {
   "name": "live-clip-workbench",
-  "version": "0.1.73",
+  "version": "0.1.74",
   "private": true,
   "description": "本地直播回放智能切片桌面工作台",
   "main": "dist-electron/main/index.js",

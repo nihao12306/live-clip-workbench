@@ -328,6 +328,7 @@ function pathLeaf(value?: string): string {
 
 function updateInstallRequest(info?: UpdateInfo | null): UpdateInstallRequest | undefined {
   if (!info) return undefined;
+  if (info.githubAssetId !== undefined) return { githubAssetId: info.githubAssetId };
   if (info.installerPath) return { installerPath: info.installerPath };
   if (info.feishuFileToken) {
     return {
@@ -4127,13 +4128,13 @@ function SettingsView({
             <p>
               {settings.feishuUpdateFolderToken
                 ? "工作台会从飞书云盘更新文件夹读取 latest.json，并按当前系统下载对应安装包。"
-                : "连接飞书并验证更新文件夹后，工作台会自动检查 Windows 和 Mac 安装包。"}
+                : "未配置团队更新源时，工作台会从 GitHub Releases 检查新版。"}
             </p>
             <Field label="本地更新清单路径（兼容旧版，可选）" hint="只有未配置飞书云端更新文件夹时才会使用。">
               <input
                 value={settings.updateManifestPath ?? ""}
                 onChange={(e) => setSettings({ ...settings, updateManifestPath: e.target.value })}
-                placeholder="留空则使用飞书云端更新"
+                placeholder="留空则按默认更新源检查"
               />
             </Field>
             <div className="post-approval">
@@ -4146,7 +4147,7 @@ function SettingsView({
                   disabled={installingUpdate}
                   onClick={() => void installUpdate()}
                 >
-                  {installingUpdate ? "正在下载更新…" : `安装 ${updateInfo.version}`}
+                  {installingUpdate ? "正在下载更新…" : updateInfo.platform === "darwin" ? "打开更新包" : `安装 ${updateInfo.version}`}
                 </button>
               )}
             </div>

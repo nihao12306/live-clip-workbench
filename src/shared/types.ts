@@ -478,9 +478,10 @@ export interface UpdateInfo {
   currentVersion: string;
   platform: "win32" | "darwin";
   available: boolean;
-  source?: "local" | "feishu";
+  source?: "local" | "feishu" | "github";
   version?: string;
   installerPath?: string;
+  githubAssetId?: number;
   feishuFileToken?: string;
   installerFileName?: string;
   installerSize?: number;
@@ -508,6 +509,7 @@ export interface UpdatePublishResult {
 
 export interface UpdateInstallRequest {
   installerPath?: string;
+  githubAssetId?: number;
   feishuFileToken?: string;
   installerFileName?: string;
   installerSize?: number;

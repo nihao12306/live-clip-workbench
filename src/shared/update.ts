@@ -1,5 +1,14 @@
 export type SupportedUpdatePlatform = "win32" | "darwin";
 
+export function compareVersions(left: string, right: string): number {
+  const a = left.split(".").map((part) => Number(part) || 0);
+  const b = right.split(".").map((part) => Number(part) || 0);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    if ((a[index] ?? 0) !== (b[index] ?? 0)) return (a[index] ?? 0) - (b[index] ?? 0);
+  }
+  return 0;
+}
+
 export interface UpdateChunk {
   fileName: string;
   size: number;
