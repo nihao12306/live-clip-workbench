@@ -3,14 +3,15 @@ set -euo pipefail
 
 workspace="$(pwd)"
 build_dir="$(mktemp -d)"
+prefix="$build_dir/install"
 if [ "${MSYSTEM:-}" = UCRT64 ]; then
   platform=win32
   architecture=x64
   extension=.exe
-  build_dir="$(cygpath -m "$build_dir")"
+  prefix="$(cygpath -m "$prefix")"
   jobs="$(nproc)"
   ass_flags=(--enable-directwrite)
-  ffmpeg_flags=(--extra-cflags="-I$build_dir/install/include" --extra-ldflags="-static -L$build_dir/install/lib" --extra-libs=-lstdc++)
+  ffmpeg_flags=(--target-os=mingw32 --extra-cflags="-I$prefix/include" --extra-ldflags="-static -L$prefix/lib" --extra-libs=-lstdc++)
 else
   platform=darwin
   architecture="$(uname -m)"
@@ -21,7 +22,6 @@ else
   ass_flags=(--enable-coretext)
   ffmpeg_flags=(--extra-libs=-lc++)
 fi
-prefix="$build_dir/install"
 sources="$build_dir/sources"
 mkdir -p "$prefix" "$sources" "$workspace/media-tools"
 
