@@ -1,0 +1,123 @@
+name: Windows x64 installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install JavaScript dependencies
+        shell: pwsh
+        run: |
+          $env:FFMPEG_BIN = (Get-Command cmd.exe).Source
+          npm.cmd ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make curl tar gzip xz
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+      - name: Build native media tools and include their sources
+        shell: msys2 {0}
+        run: bash .github/scripts/build-media-tools.sh
+      - name: Build the Windows installer
+        shell: pwsh
+        run: |
+          npm.cmd run dist -- --win nsis --x64 --publish never
+          exit $LASTEXITCODE
+      - name: Verify the installed application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem release -Filter '*-win-x64.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected one Windows installer' }
+          $installer = $installers[0]
+          $installed = Join-Path $env:RUNNER_TEMP 'live-clip-workbench-installed'
+          $setup = Start-Process -FilePath $installer.FullName -ArgumentList "/S /D=$installed" -WindowStyle Hidden -PassThru
+          if (-not $setup.WaitForExit(90000)) { Stop-Process -Id $setup.Id; throw 'Installer timed out' }
+          if ($setup.ExitCode -ne 0) { throw "Installer exited with $($setup.ExitCode)" }
+          $app = Get-ChildItem -LiteralPath $installed -Filter '*.exe' -File | Where-Object Name -NotLike 'Uninstall*' | Select-Object -First 1
+          if (-not $app) { throw 'Installed application not found' }
+          $unpacked = Join-Path $installed 'resources/app.asar.unpacked'
+          $ffmpeg = Join-Path $unpacked 'node_modules/ffmpeg-static/ffmpeg.exe'
+          $ffprobe = Join-Path $unpacked 'node_modules/ffprobe-static/bin/win32/x64/ffprobe.exe'
+          foreach ($tool in $ffmpeg, $ffprobe) {
+            $config = & $tool -buildconf 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0 -or $config -match '--enable-nonfree') { throw "Invalid media executable: $tool" }
+          }
+          if (-not (Test-Path (Join-Path $unpacked 'media-tools/ffmpeg-corresponding-source.tar.gz'))) { throw 'Missing media sources' }
+          & $ffmpeg -v error -f lavfi -i color=size=160x120:rate=25 -t 1 -c:v libx264 release/media-test.mp4
+          if ($LASTEXITCODE -ne 0) { throw 'H.264 encoding failed' }
+          $codec = & $ffprobe -v error -show_entries stream=codec_name -of csv=p=0 release/media-test.mp4
+          if ($LASTEXITCODE -ne 0 -or $codec -ne 'h264') { throw 'Media probing failed' }
+          $filters = & $ffmpeg -filters 2>&1 | Out-String
+          if ($filters -notmatch '\bsubtitles\b' -or $filters -notmatch '\bdrawtext\b') { throw 'Missing subtitle or text filter' }
+          $screenshot = Join-Path (Resolve-Path release).Path 'windows-smoke.png'
+          $stdout = Join-Path $env:RUNNER_TEMP 'workbench-stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'workbench-stderr.log'
+          $process = Start-Process -FilePath $app.FullName -ArgumentList '--smoke-test', ('"--screenshot=' + $screenshot + '"') -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          if (-not $process.WaitForExit(40000)) { Stop-Process -Id $process.Id; Get-Content $stderr; throw 'Application startup timed out' }
+          Get-Content $stdout,$stderr
+          if ($process.ExitCode -ne 0 -or -not (Select-String -LiteralPath $stdout -SimpleMatch 'SMOKE_TEST_READY' -Quiet) -or -not (Test-Path $screenshot)) {
+            throw 'Installed application smoke test failed'
+          }
+          $digest = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $($installer.Name)" | Set-Content -LiteralPath release/SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: |
+            release/*-win-x64.exe
+            release/SHA256SUMS.txt
+            release/windows-smoke.png
+          if-no-files-found: error
+          compression-level: 0
+
+  attach:
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+          path: package
+      - name: Add the installer to the matching release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd package
+          sha256sum -c SHA256SUMS.txt
+          file=(live-clip-workbench-*-win-x64.exe)
+          test "${#file[@]}" = 1
+          name="${file[0]}"
+          version="${name#live-clip-workbench-}"
+          version="${version%-win-x64.exe}"
+          tag="v$version"
+          release="repos/$GITHUB_REPOSITORY/releases/tags/$tag"
+          gh api "$release" --jq .id
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$name#Windows x64"
+          actual="$(gh api "$release" --jq ".assets[] | select(.name == \"$name\" and .state == \"uploaded\") | .digest")"
+          expected="$(sha256sum "$name" | cut -d' ' -f1)"
+          test "$actual" = "sha256:$expected"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "直播切片工作台 $version · Windows 和 macOS"

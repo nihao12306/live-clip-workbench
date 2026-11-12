@@ -39,7 +39,7 @@ jobs:
           for tool in meson ninja nasm pkg-config; do
             command -v "$tool" >/dev/null || brew install "$tool"
           done
-          bash .github/scripts/build-mac-media-tools.sh
+          bash .github/scripts/build-media-tools.sh
           test "$(node -p process.arch)" = "$TARGET_ARCH"
           npm run build
           npx --no-install electron-builder --mac dmg --"$TARGET_ARCH" --publish never

@@ -3,15 +3,31 @@ set -euo pipefail
 
 workspace="$(pwd)"
 build_dir="$(mktemp -d)"
+if [ "${MSYSTEM:-}" = UCRT64 ]; then
+  platform=win32
+  architecture=x64
+  extension=.exe
+  build_dir="$(cygpath -m "$build_dir")"
+  jobs="$(nproc)"
+  ass_flags=(--enable-directwrite)
+  ffmpeg_flags=(--extra-cflags="-I$build_dir/install/include" --extra-ldflags="-static -L$build_dir/install/lib" --extra-libs=-lstdc++)
+else
+  platform=darwin
+  architecture="$(uname -m)"
+  if [ "$architecture" = x86_64 ]; then architecture=x64; fi
+  extension=
+  jobs="$(sysctl -n hw.ncpu)"
+  export MACOSX_DEPLOYMENT_TARGET=12.0
+  ass_flags=(--enable-coretext)
+  ffmpeg_flags=(--extra-libs=-lc++)
+fi
 prefix="$build_dir/install"
 sources="$build_dir/sources"
 mkdir -p "$prefix" "$sources" "$workspace/media-tools"
 
-# Keep Homebrew libraries out of the resulting portable executables.
+# Keep ambient libraries out of the resulting portable executables.
 export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
 export PKG_CONFIG_PATH=""
-export MACOSX_DEPLOYMENT_TARGET=12.0
-jobs="$(sysctl -n hw.ncpu)"
 
 fetch() {
   local name="$1" url="$2"
@@ -26,6 +42,16 @@ fetch fribidi https://github.com/fribidi/fribidi/releases/download/v1.0.16/fribi
 fetch harfbuzz https://github.com/harfbuzz/harfbuzz/releases/download/8.5.0/harfbuzz-8.5.0.tar.xz
 fetch libass https://github.com/libass/libass/releases/download/0.17.4/libass-0.17.4.tar.xz
 fetch ffmpeg https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
+if [ "$platform" = win32 ]; then
+  fetch zlib https://zlib.net/fossils/zlib-1.3.1.tar.gz
+  (
+    cd "$build_dir/zlib"
+    make -f win32/Makefile.gcc -j"$jobs" libz.a
+    mkdir -p "$prefix/include" "$prefix/lib"
+    cp zlib.h zconf.h "$prefix/include/"
+    cp libz.a "$prefix/lib/"
+  )
+fi
 
 (
   cd "$build_dir/x264"
@@ -49,7 +75,7 @@ meson compile -C "$build_dir/harfbuzz-build" -j "$jobs"
 meson install -C "$build_dir/harfbuzz-build"
 (
   cd "$build_dir/libass"
-  ./configure --prefix="$prefix" --disable-shared --disable-fontconfig --enable-coretext
+  ./configure --prefix="$prefix" --disable-shared --disable-fontconfig "${ass_flags[@]}"
   make -j"$jobs" install
 )
 (
@@ -57,19 +83,16 @@ meson install -C "$build_dir/harfbuzz-build"
   ./configure --prefix="$prefix" --disable-autodetect --disable-doc --disable-ffplay \
     --enable-gpl --enable-libx264 --enable-libass --enable-libfreetype \
     --enable-libharfbuzz --enable-libfribidi --enable-zlib \
-    --pkg-config-flags=--static --extra-libs=-lc++
-  make -j"$jobs" ffmpeg ffprobe
+    --pkg-config-flags=--static "${ffmpeg_flags[@]}"
+  make -j"$jobs" "ffmpeg$extension" "ffprobe$extension"
 )
-install -m 755 "$build_dir/ffmpeg/ffmpeg" "$workspace/node_modules/ffmpeg-static/ffmpeg"
+install -m 755 "$build_dir/ffmpeg/ffmpeg$extension" "$workspace/node_modules/ffmpeg-static/ffmpeg$extension"
 rm -rf "$workspace/node_modules/ffprobe-static/bin"
-ffprobe_dir="$workspace/node_modules/ffprobe-static/bin/darwin/$(uname -m)"
-if [ "$(uname -m)" = x86_64 ]; then
-  ffprobe_dir="$workspace/node_modules/ffprobe-static/bin/darwin/x64"
-fi
+ffprobe_dir="$workspace/node_modules/ffprobe-static/bin/$platform/$architecture"
 mkdir -p "$ffprobe_dir"
-install -m 755 "$build_dir/ffmpeg/ffprobe" "$ffprobe_dir/ffprobe"
+install -m 755 "$build_dir/ffmpeg/ffprobe$extension" "$ffprobe_dir/ffprobe$extension"
 
-cp "$workspace/.github/scripts/build-mac-media-tools.sh" "$sources/"
+cp "$workspace/.github/scripts/build-media-tools.sh" "$sources/"
 cp "$workspace/LICENSE" "$workspace/media-tools/WORKBENCH-LICENSE.txt"
 cp "$build_dir/ffmpeg/COPYING.GPLv2" "$workspace/media-tools/FFMPEG-GPL-2.0.txt"
 cat > "$workspace/media-tools/FFMPEG-NOTICE.txt" <<'EOF'
