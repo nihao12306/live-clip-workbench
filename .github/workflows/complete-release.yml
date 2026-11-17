@@ -1,0 +1,120 @@
+name: Recover a release from a verified Mac build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to complete
+        required: true
+        type: string
+      mac_run:
+        description: Actions run ID with the verified Apple Silicon artifact
+        required: true
+        type: string
+      media_baseline:
+        description: Prior Windows release with matching media tools and sources
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      RUN: ${{ inputs.mac_run }}
+    steps:
+      - name: Check verified artifact provenance
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$RUN" =~ ^[0-9]+$ ]]
+          jobs="repos/$GITHUB_REPOSITORY/actions/runs/$RUN"
+          test "$(gh api "$jobs" --jq .head_branch)" = "$TAG"
+          test "$(gh api "$jobs/jobs" --jq '.jobs[] | select(.name == "macOS arm64") | .conclusion')" = success
+      - uses: actions/download-artifact@v8
+        with:
+          name: mac-release-arm64
+          run-id: ${{ inputs.mac_run }}
+          github-token: ${{ github.token }}
+      - name: Publish the verified Apple Silicon installer
+        run: |
+          set -euo pipefail
+          sha256sum -c SHA256SUMS.txt
+          version="${TAG#v}"
+          file="live-clip-workbench-$version-mac-arm64.dmg"
+          cat > release-notes.md <<'EOF'
+          Apple 芯片（M 系列）下载 arm64 DMG，打开后将工作台拖入「应用程序」。
+          Windows x64 的安装包通过验证后会添加到本页。
+
+          新版支持先作选题判断，再填理由，并显示实际模型调用的学习回执。场次历史可删除单条记录及对应的本机稿件和逐字稿。
+          Mac 安装包未做 Apple Developer ID 签名或公证。
+          EOF
+          releases="repos/$GITHUB_REPOSITORY/releases"
+          find_release() {
+            gh api --paginate "$releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id"
+          }
+          id="$(find_release)"
+          if [ -z "$id" ]; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --title "直播切片工作台 $version" --notes-file release-notes.md
+            id="$(find_release)"
+          fi
+          test -n "$id"
+          filter=".[] | select(.name == \"$file\" and .state == \"uploaded\") | .digest"
+          checksum="$(sha256sum "$file" | cut -d' ' -f1)"
+          actual="$(gh api "$releases/$id/assets" --jq "$filter")"
+          if [ -z "$actual" ]; then
+            gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY"
+            actual="$(gh api "$releases/$id/assets" --jq "$filter")"
+          fi
+          test "$actual" = "sha256:$checksum"
+          if [ "$(gh api "$releases/$id" --jq .draft)" = true ]; then
+            gh api --method PATCH "$releases/$id" -F draft=false -f make_latest=true --jq .html_url
+          fi
+
+  windows:
+    uses: ./.github/workflows/windows-release.yml
+    with:
+      source_tag: ${{ inputs.tag }}
+      media_baseline: ${{ inputs.media_baseline }}
+
+  publish-windows:
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+      - name: Publish the verified Windows installer
+        run: |
+          set -euo pipefail
+          sha256sum -c SHA256SUMS.txt
+          version="${TAG#v}"
+          file="live-clip-workbench-$version-win-x64.exe"
+          release="repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
+          filter=".assets[] | select(.name == \"$file\" and .state == \"uploaded\") | .digest"
+          actual="$(gh api "$release" --jq "$filter")"
+          if [ -z "$actual" ]; then
+            gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY"
+            actual="$(gh api "$release" --jq "$filter")"
+          fi
+          test "$actual" = "sha256:$(sha256sum "$file" | cut -d' ' -f1)"
+          cat > release-notes.md <<'EOF'
+          Windows x64 下载 EXE 安装程序。Apple 芯片（M 系列）下载 arm64 DMG，打开后将工作台拖入「应用程序」。
+
+          新版支持先作选题判断，再填理由，并显示实际模型调用的学习回执。场次历史可删除单条记录及对应的本机稿件和逐字稿。
+          Mac 安装包未做 Apple Developer ID 签名或公证。
+          EOF
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "直播切片工作台 $version · Windows 和 macOS" --notes-file release-notes.md

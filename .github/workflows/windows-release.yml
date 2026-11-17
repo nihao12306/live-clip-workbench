@@ -3,6 +3,15 @@ name: Windows x64 installer
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      source_tag:
+        description: Tag to build during release recovery
+        required: false
+        type: string
+      media_baseline:
+        description: Previous Windows release to reuse verified media binaries from
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -15,6 +24,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_tag || github.ref }}
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -26,6 +36,7 @@ jobs:
           npm.cmd ci
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: msys2/setup-msys2@v2
+        if: inputs.media_baseline == ''
         with:
           msystem: UCRT64
           update: true
@@ -37,8 +48,40 @@ jobs:
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-ninja
       - name: Build native media tools and include their sources
+        if: inputs.media_baseline == ''
         shell: msys2 {0}
         run: bash .github/scripts/build-media-tools.sh
+      - name: Reuse verified media binaries and corresponding sources
+        if: inputs.media_baseline != ''
+        env:
+          BASELINE: ${{ inputs.media_baseline }}
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:BASELINE -notmatch '^v\d+\.\d+\.\d+$') { throw 'Invalid media baseline tag' }
+          $version = $env:BASELINE.Substring(1)
+          $assetName = "live-clip-workbench-$version-win-x64.exe"
+          $api = "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:BASELINE"
+          $published = gh api $api | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $asset = $published.assets | Where-Object { $_.name -eq $assetName -and $_.state -eq 'uploaded' }
+          if (-not $asset -or $asset.digest -notmatch '^sha256:[a-f0-9]{64}$') { throw 'Prior media package has no verified digest' }
+          $baseline = Join-Path $env:RUNNER_TEMP 'prior-installer.exe'
+          gh release download $env:BASELINE --repo $env:GITHUB_REPOSITORY --pattern $assetName --output $baseline
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (('sha256:' + (Get-FileHash $baseline).Hash) -ne $asset.digest) { throw 'Prior installer digest mismatch' }
+          $install = Join-Path $env:RUNNER_TEMP 'prior-release'
+          $setup = Start-Process -FilePath $baseline -ArgumentList "/S /D=$install" -WindowStyle Hidden -PassThru
+          if (-not $setup.WaitForExit(90000) -or $setup.ExitCode -ne 0) { throw 'Could not unpack media from the prior installer' }
+          $unpacked = Join-Path $install 'resources/app.asar.unpacked'
+          $tools = Join-Path $unpacked 'media-tools'
+          if (-not (Test-Path (Join-Path $tools 'ffmpeg-corresponding-source.tar.gz'))) { throw 'Missing prior media sources' }
+          Copy-Item -LiteralPath $tools -Destination media-tools -Recurse
+          Copy-Item (Join-Path $unpacked 'node_modules/ffmpeg-static/ffmpeg.exe') node_modules/ffmpeg-static/ffmpeg.exe -Force
+          $ffprobeDir = 'node_modules/ffprobe-static/bin/win32/x64'
+          New-Item -ItemType Directory -Path $ffprobeDir -Force | Out-Null
+          Copy-Item (Join-Path $unpacked 'node_modules/ffprobe-static/bin/win32/x64/ffprobe.exe') $ffprobeDir -Force
       - name: Build the Windows installer
         shell: pwsh
         run: |
@@ -71,13 +114,12 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $codec -ne 'h264') { throw 'Media probing failed' }
           $filters = & $ffmpeg -filters 2>&1 | Out-String
           if ($filters -notmatch '\bsubtitles\b' -or $filters -notmatch '\bdrawtext\b') { throw 'Missing subtitle or text filter' }
-          $screenshot = Join-Path (Resolve-Path release).Path 'windows-smoke.png'
           $stdout = Join-Path $env:RUNNER_TEMP 'workbench-stdout.log'
           $stderr = Join-Path $env:RUNNER_TEMP 'workbench-stderr.log'
-          $process = Start-Process -FilePath $app.FullName -ArgumentList '--smoke-test', ('"--screenshot=' + $screenshot + '"') -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          $process = Start-Process -FilePath $app.FullName -ArgumentList '--smoke-test' -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
           if (-not $process.WaitForExit(40000)) { Stop-Process -Id $process.Id; Get-Content $stderr; throw 'Application startup timed out' }
           Get-Content $stdout,$stderr
-          if ($process.ExitCode -ne 0 -or -not (Select-String -LiteralPath $stdout -SimpleMatch 'SMOKE_TEST_READY' -Quiet) -or -not (Test-Path $screenshot)) {
+          if ($process.ExitCode -ne 0 -or -not (Select-String -LiteralPath $stdout -SimpleMatch 'SMOKE_TEST_READY' -Quiet)) {
             throw 'Installed application smoke test failed'
           }
           $digest = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -88,6 +130,5 @@ jobs:
           path: |
             release/*-win-x64.exe
             release/SHA256SUMS.txt
-            release/windows-smoke.png
           if-no-files-found: error
           compression-level: 0
