@@ -91,35 +91,3 @@ jobs:
             release/windows-smoke.png
           if-no-files-found: error
           compression-level: 0
-
-  attach:
-    if: github.event_name == 'workflow_dispatch'
-    needs: windows
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: windows-x64
-          path: package
-      - name: Add the installer to the matching release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          cd package
-          sha256sum -c SHA256SUMS.txt
-          file=(live-clip-workbench-*-win-x64.exe)
-          test "${#file[@]}" = 1
-          name="${file[0]}"
-          version="${name#live-clip-workbench-}"
-          version="${version%-win-x64.exe}"
-          tag="v$version"
-          release="repos/$GITHUB_REPOSITORY/releases/tags/$tag"
-          gh api "$release" --jq .id
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$name#Windows x64"
-          actual="$(gh api "$release" --jq ".assets[] | select(.name == \"$name\" and .state == \"uploaded\") | .digest")"
-          expected="$(sha256sum "$name" | cut -d' ' -f1)"
-          test "$actual" = "sha256:$expected"
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "直播切片工作台 $version · Windows 和 macOS"
