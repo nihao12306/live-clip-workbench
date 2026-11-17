@@ -4,7 +4,12 @@ export type TextPick = { id: string; ranges: TextRange[] };
 export type TextReview = { summary: string; issues: { from: number; to: number; why: string; suggestion: string }[] };
 export type TextEdit = { title: string; hook: TextPick | null; repeatHook: boolean; body: TextPick[] };
 export type TextTopicVerdict = 'good' | 'bad' | 'incomplete' | 'duplicate' | 'deferred';
-export const topicVerdictLabels: Record<TextTopicVerdict, string> = { good: '选题值得做', bad: '选题不合适', incomplete: '题目好，原话不完整', duplicate: '已做过或重复', deferred: '暂时不采用' };
+export const topicVerdictLabels: Record<TextTopicVerdict, string> = { good: '选题值得做', bad: '选题不值得做', incomplete: '题目好，原话不完整', duplicate: '已做过或重复', deferred: '暂时不采用' };
+export type TextTopicFeedback = { verdict: TextTopicVerdict; reason: string; teacher: string; updatedAt: string };
+export type TopicFeedbackRef = { jobId: string; clipId: string; updatedAt: string };
+export type TopicFeedbackStage = 'scan' | 'review' | 'final';
+export const topicFeedbackStageLabels: Record<TopicFeedbackStage, string> = { scan: '初选', review: '复审', final: '最终择优' };
+export type TopicFeedbackUse = { stage: TopicFeedbackStage; respondedAt: string; feedback: TopicFeedbackRef[] };
 export type TextFinalVersion = { revision: number; edit: TextEdit; teacher: string; confirmedAt: string; note: string; status: 'confirmed' | 'outdated' | 'withdrawn' };
 export type TextBodyComparison = { before: Array<{ id: string; text: string }>; after: Array<{ id: string; text: string }>;
   changes: Array<{ id: string; sourceText: string; before: string; after: string; removed: string[]; added: string[]; toHook?: string[]; fromHook?: string[]; moved: boolean }> };
@@ -17,7 +22,7 @@ export type TextClip = TextEdit & {
   titles: string[];
   hooks: TextPick[];
   notes: string[];
-  topicFeedback?: { verdict: TextTopicVerdict; reason: string; teacher: string; updatedAt: string };
+  topicFeedback?: TextTopicFeedback;
   topicFeedbackHistory?: Array<{ verdict: TextTopicVerdict | 'cleared'; reason: string; teacher: string; updatedAt: string }>;
   confirmedFinal?: TextFinalVersion;
   finalHistory?: TextFinalVersion[];
@@ -60,9 +65,25 @@ export type TextJob = {
   transcriptSavedAt?: string;
   teacher?: string;
   deliveries?: TextDelivery[];
+  topicFeedbackUses?: TopicFeedbackUse[];
   qualityAudit?: { proposed: number; approved: number; extraReview: boolean; qualified?: number; outputLimit?: number; reused?: boolean; policyVersion?: string; model?: string; thinking?: string; decisions: Array<{ name: string; approved: boolean; reason: string; round?: string; watchReason?: string; valueType?: string }> };
   failureStage?: '读取逐字稿' | '筛选话题' | '整理候选';
 };
+
+const isTopicQuality = (verdict: TextTopicVerdict) => verdict === 'good' || verdict === 'bad';
+
+function savedTopicFeedback(clip: TextClip, quality: boolean): TextTopicFeedback | undefined {
+  if (clip.topicFeedback && isTopicQuality(clip.topicFeedback.verdict) === quality) return clip.topicFeedback;
+  const history = clip.topicFeedbackHistory ?? [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const record = history[i];
+    if (record.verdict === 'cleared') return undefined;
+    if (isTopicQuality(record.verdict) === quality) return { ...record, verdict: record.verdict };
+  }
+}
+
+export const savedTopicQuality = (clip: TextClip) => savedTopicFeedback(clip, true);
+export const savedTopicDisposition = (clip: TextClip) => savedTopicFeedback(clip, false);
 
 export function originalTextSource(job: TextJob): string { return job.originalUrl ?? job.url; }
 

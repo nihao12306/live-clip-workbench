@@ -652,6 +652,7 @@ export interface WorkbenchApi {
   startTextJobs(inputs: import('./text-selection').TextJobInput[]): Promise<import('./text-selection').TextJob[]>;
   retryTextJob(jobId: string): Promise<import('./text-selection').TextJob>;
   dismissTextJob(jobId: string): Promise<void>;
+  deleteTextJob(jobId: string): Promise<boolean>;
   renameTextJob(jobId: string, name: string, teacher?: string): Promise<import('./text-selection').TextJob>;
   readTextTranscript(jobId: string): Promise<import('./text-selection').TextUnit[]>;
   supplementTextJob(jobId: string, startMs: number, endMs: number): Promise<import('./text-selection').TextClip>;

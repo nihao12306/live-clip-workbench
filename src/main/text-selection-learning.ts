@@ -1,9 +1,11 @@
 import type { AccountProfile } from '../shared/types';
 import { buildTextLearning } from './text-learning';
-import type { TextJob } from '../shared/text-selection';
+import { savedTopicDisposition, savedTopicQuality } from '../shared/text-selection';
+import type { TextJob, TopicFeedbackRef } from '../shared/text-selection';
 
 /** Human topic judgements are examples, never inferred from model approvals or exports. */
-export function buildSelectionLearning(jobs: TextJob[], job: TextJob, topic = '', accounts: AccountProfile[] = []) {
+export function buildSelectionLearning(jobs: TextJob[], job: TextJob, topic = '', accounts: AccountProfile[] = [],
+  selectedFeedback?: (refs: TopicFeedbackRef[]) => void) {
   const fullTextExperience = buildTextLearning(jobs, job, topic).context;
   const textExperience = fullTextExperience ? { ...fullTextExperience, teacherExperience: fullTextExperience.teacherExperience ? {
     ...fullTextExperience.teacherExperience, examples: fullTextExperience.teacherExperience.examples.map(example => ({
@@ -24,7 +26,10 @@ export function buildSelectionLearning(jobs: TextJob[], job: TextJob, topic = ''
     boundary: '来自明确匹配的老师账号规则与样片模式，不代表用户认可了当前候选；只参考模式与偏好，不能复用旧事实，不能跨老师套用。',
   } : undefined;
   const candidates = jobs.flatMap(item => item.clips.flatMap(clip => {
-    const explicit = clip.topicFeedback;
+    const quality = savedTopicQuality(clip);
+    const disposition = savedTopicDisposition(clip);
+    const explicit = quality ?? disposition;
+    const incomplete = quality && disposition?.verdict === 'incomplete' ? disposition : undefined;
     // Planning decisions are recorded, but never treated as negative topic quality.
     const exported = item.deliveries?.filter(delivery => delivery.clipId === clip.id).sort((a, b) => (b.exportedAt ?? '').localeCompare(a.exportedAt ?? ''))[0];
     const cleared = clip.topicFeedbackHistory?.at(-1);
@@ -36,6 +41,8 @@ export function buildSelectionLearning(jobs: TextJob[], job: TextJob, topic = ''
     return [{ teacher: normalize(feedback.teacher), replay,
       key: replay + ':' + clip.units[0]?.startMs + ':' + clip.units.at(-1)?.endMs,
       topic: clip.name, title: clip.title, verdict: feedback.verdict, reason: feedback.reason,
+      completenessNote: incomplete?.reason,
+      refs: [explicit, incomplete].flatMap(record => record ? [{ jobId: item.id, clipId: clip.id, updatedAt: record.updatedAt }] : []),
       updatedAt: feedback.updatedAt }];
   })).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   const seen = new Set<string>();
@@ -50,17 +57,18 @@ export function buildSelectionLearning(jobs: TextJob[], job: TextJob, topic = ''
     score: [...grams(sample.topic + sample.reason)].filter(g => query.has(g)).length }))
     .sort((a, b) => b.score - a.score).map(({ sample }) => sample);
   const example = (sample: typeof unique[number]) => ({ teacher: sample.teacher, topic: sample.topic,
-    title: sample.title, verdict: sample.verdict, reason: sample.reason,
+    title: sample.title, verdict: sample.verdict, reason: sample.reason, completenessNote: sample.completenessNote,
     scope: sample.verdict === 'incomplete' ? '本场原文完整性；题目本身可有价值，不得当作题材负评' : sample.verdict === 'adopted' ? '采用事实，弱参考，不是明确质量认可' : '选题质量的明确反馈' });
   const currentSource = new URL(job.url);
   const currentReplay = currentSource.origin + currentSource.pathname;
-  const personal = rank(unique.filter(s => teacher ? s.teacher === teacher : !s.teacher && s.replay === currentReplay)).slice(0, 6).map(example);
+  const personal = rank(unique.filter(s => teacher ? s.teacher === teacher : !s.teacher && s.replay === currentReplay)).slice(0, 6);
   const otherTeachers = unique.filter(s => s.teacher && s.teacher !== teacher);
   const crossTeacher = new Set(otherTeachers.map(s => s.teacher)).size >= 2
     && new Set(otherTeachers.map(s => s.replay)).size >= 2
-    ? rank(otherTeachers).slice(0, 4).map(example) : [];
+    ? rank(otherTeachers).slice(0, 4) : [];
+  selectedFeedback?.([...personal, ...crossTeacher].flatMap(sample => sample.refs));
   const selectionFeedback = personal.length || crossTeacher.length ? {
-    teacherExamples: personal, crossTeacherExamples: crossTeacher,
+    teacherExamples: personal.map(example), crossTeacherExamples: crossTeacher.map(example),
     boundary: '区分明确的选题好坏、原文完整性反馈与曾采用事实；不完整不等于选题不好，曾导出也不等于优质。未采用的排期/重复原因不参与质量学习。这些记录不是模型自评。例子用于理解受众价值与不合适的原因，不可照抄其中事实；不同老师不得直接套用个人偏好。没有反馈不表示认可。',
   } : undefined;
   return textExperience || selectionFeedback || accountReference ? { textExperience, selectionFeedback, accountReference } : undefined;

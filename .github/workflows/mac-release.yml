@@ -1,4 +1,4 @@
-name: Publish Mac installers
+name: Publish Windows and Apple Silicon installers
 
 on:
   push:
@@ -9,19 +9,11 @@ permissions:
 
 jobs:
   mac:
-    name: macOS ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+    name: macOS arm64
+    runs-on: macos-15
     timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-          - runner: macos-15-intel
-            arch: x64
     env:
-      TARGET_ARCH: ${{ matrix.arch }}
+      TARGET_ARCH: arm64
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - uses: actions/checkout@v6
@@ -55,13 +47,12 @@ jobs:
           app=("$mount_dir"/*.app)
           test "${#app[@]}" = 1
           executable="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "${app[0]}/Contents/Info.plist")"
+          test "$(lipo -archs "${app[0]}/Contents/MacOS/$executable")" = "$TARGET_ARCH"
           resources="${app[0]}/Contents/Resources/app.asar.unpacked/node_modules"
-          native_arch="$TARGET_ARCH"
-          if [ "$native_arch" = x64 ]; then native_arch=x86_64; fi
           ffmpeg="$resources/ffmpeg-static/ffmpeg"
           ffprobe="$resources/ffprobe-static/bin/darwin/$TARGET_ARCH/ffprobe"
           for tool in "$ffmpeg" "$ffprobe"; do
-            test "$(lipo -archs "$tool")" = "$native_arch"
+            test "$(lipo -archs "$tool")" = "$TARGET_ARCH"
             "$tool" -buildconf > release/media-build.txt 2>&1
             if grep -q -- '--enable-nonfree' release/media-build.txt; then exit 1; fi
             otool -L "$tool" | tail -n +2 | awk '$1 !~ /^\/(usr\/lib|System\/Library)\// { bad = 1 } END { exit bad }'
@@ -77,18 +68,21 @@ jobs:
           (cd release && shasum -a 256 *-mac-"$TARGET_ARCH".dmg > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v7
         with:
-          name: mac-release-${{ matrix.arch }}
+          name: mac-release-arm64
           path: |
-            release/*-mac-${{ matrix.arch }}.dmg
+            release/*-mac-arm64.dmg
             release/SHA256SUMS.txt
             release/mac-smoke.png
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
 
+  windows:
+    uses: ./.github/workflows/windows-release.yml
+
   release:
-    name: Publish verified Mac installers
-    needs: mac
+    name: Publish verified installers
+    needs: [mac, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -96,23 +90,24 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: packages
-          pattern: mac-release-*
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          prefix="live-clip-workbench-$version-mac"
-          arm="packages/mac-release-arm64/$prefix-arm64.dmg"
-          intel="packages/mac-release-x64/$prefix-x64.dmg"
-          for directory in packages/mac-release-arm64 packages/mac-release-x64; do
+          prefix="live-clip-workbench-$version"
+          arm="packages/mac-release-arm64/$prefix-mac-arm64.dmg"
+          windows="packages/windows-x64/$prefix-win-x64.exe"
+          for directory in packages/mac-release-arm64 packages/windows-x64; do
             (cd "$directory" && sha256sum -c SHA256SUMS.txt)
           done
           cat > release-notes.md <<'EOF'
-          下载对应芯片的 DMG，打开后将工作台拖入「应用程序」。
-          - Apple 芯片（M 系列）选 arm64。
-          - Intel 芯片选 x64。
+          - Windows x64 下载 EXE 安装程序。
+          - Mac Apple 芯片（M 系列）下载 arm64 DMG，将工作台拖入「应用程序」。
+
+          文字选稿支持先选「值得做」或「不值得做」，再填写理由并保存。学习回执记录哪些反馈实际随初选、复审和最终择优请求发送并收到模型回复。
+          场次历史可删除单条记录和对应的本机稿件及逐字稿。
 
           社区版使用 GitHub Releases 检查更新。收到提醒后可在应用内下载并打开 DMG。
           Mac 安装包未做 Apple Developer ID 签名或公证。
@@ -125,12 +120,12 @@ jobs:
           release_id="$(find_release_id)"
           if [ -z "$release_id" ]; then
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --verify-tag --draft --title "直播切片工作台 $version · macOS" --notes-file release-notes.md
+              --verify-tag --draft --title "直播切片工作台 $version · Windows 和 macOS" --notes-file release-notes.md
             release_id="$(find_release_id)"
           fi
           test -n "$release_id"
           release="$releases/$release_id"
-          for file in "$arm" "$intel"; do
+          for file in "$arm" "$windows"; do
             name="$(basename "$file")"
             checksum="$(sha256sum "$file" | cut -d' ' -f1)"
             asset_filter=".[] | select(.name == \"$name\")"

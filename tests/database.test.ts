@@ -1,8 +1,11 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DatabaseService } from "../src/main/database";
+import { TextWorkbench } from "../src/main/text-workbench";
+import type { TextJob } from "../src/shared/text-selection";
 import type { Candidate, ClipTask } from "../src/shared/types";
 
 const tempDirs: string[] = [];
@@ -12,6 +15,46 @@ afterEach(() => {
 });
 
 describe("DatabaseService", () => {
+  it("deletes a text history and its saved transcript, retaining source data until the last version is deleted", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "live-clip-history-delete-"));
+    tempDirs.push(directory);
+    const databasePath = path.join(directory, "workbench.sqlite");
+    const db = new DatabaseService(databasePath);
+    await db.initialize();
+    const url = "https://tingwu.aliyun.com/doc/transcripts/shared";
+    const first: TextJob = { id: "first", url, source: "tingwu", createdAt: "2026-11-01", status: "ready", message: "", clips: [] };
+    const second: TextJob = { ...first, id: "second", status: "failed" };
+    const other: TextJob = { ...first, id: "other", url: url + "-other" };
+    const subtitle = path.join(directory, "imported.srt");
+    const transcript = [{ id: "S1", startMs: 0, endMs: 3000, text: "完整逐字稿" }];
+    fs.writeFileSync(subtitle, "原始字幕");
+    db.setSetting("text-selection-jobs-v1", [first, other]);
+    db.setSetting("text-selection-pending-v1", [{ job: second, subtitleFile: subtitle }]);
+    db.setSetting("text-source:first", transcript);
+    db.setSetting("text-source:second", transcript);
+    db.setSetting("text-source:other", transcript);
+    const cacheKey = "text-source-cache:" + createHash("sha256").update(url).digest("hex");
+    db.setSetting(cacheKey, { units: transcript, savedAt: first.createdAt });
+    const source = { identify: vi.fn(), readTranscript: vi.fn() };
+    const model = { textSelection: vi.fn() };
+    const workbench = new TextWorkbench(db, source, model);
+
+    workbench.delete(first.id);
+    expect(db.getSetting("text-source:first", null)).toBeNull();
+    expect(db.getSetting(cacheKey, null)).not.toBeNull();
+    workbench.delete(second.id);
+    db.close();
+
+    const reopened = new DatabaseService(databasePath);
+    await reopened.initialize();
+    expect(new TextWorkbench(reopened, source, model).list()).toEqual([other]);
+    expect(reopened.getSetting("text-source:second", null)).toBeNull();
+    expect(reopened.getSetting(cacheKey, null)).toBeNull();
+    expect(reopened.getSetting("text-source:other", null)).toEqual(transcript);
+    expect(fs.readFileSync(subtitle, "utf8")).toBe("原始字幕");
+    reopened.close();
+  });
+
   it("persists accounts, tasks and restart recovery", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "live-clip-db-"));
     tempDirs.push(directory);

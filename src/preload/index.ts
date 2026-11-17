@@ -12,6 +12,7 @@ const api: WorkbenchApi = {
   startTextJobs: inputs => ipcRenderer.invoke('text:start', inputs),
   retryTextJob: jobId => ipcRenderer.invoke('text:retry', jobId),
   dismissTextJob: jobId => ipcRenderer.invoke('text:dismiss', jobId),
+  deleteTextJob: jobId => ipcRenderer.invoke('text:delete', jobId),
   renameTextJob: (jobId, name, teacher) => ipcRenderer.invoke('text:rename', jobId, name, teacher),
   readTextTranscript: jobId => ipcRenderer.invoke('text:transcript', jobId),
   supplementTextJob: (jobId, startMs, endMs) => ipcRenderer.invoke('text:supplement', jobId, startMs, endMs),

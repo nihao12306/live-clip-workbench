@@ -999,6 +999,25 @@ function registerIpc(): void {
   ipcMain.handle("text:start", (_event, inputs: TextJobInput[]) => textWorkbench.start(inputs));
   ipcMain.handle("text:retry", (_event, jobId: string) => textWorkbench.retry(jobId));
   ipcMain.handle("text:dismiss", (_event, jobId: string) => textWorkbench.dismiss(jobId));
+  ipcMain.handle("text:delete", async (_event, jobId: string) => {
+    const job = textWorkbench.list().find(item => item.id === jobId);
+    if (!job) throw new Error("找不到这场直播的历史记录");
+    if (job.status === "running") throw new Error("这场直播正在处理，请完成后再删除");
+    const options: Electron.MessageBoxOptions = {
+      type: "warning",
+      title: "删除场次记录",
+      message: `删除「${job.name || job.teacher || "此场回放"}」？`,
+      detail: "将删除这条记录的本机稿件、整场逐字稿和相关改稿经验。其他版本仍可使用共用的逐字稿。原始字幕文件和已交付的飞书文档会保留。此操作无法撤销。",
+      buttons: ["取消", "删除"],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    };
+    const { response } = mainWindow ? await dialog.showMessageBox(mainWindow, options) : await dialog.showMessageBox(options);
+    if (response !== 1) return false;
+    textWorkbench.delete(jobId);
+    return true;
+  });
   ipcMain.handle("text:transcript", (_event, jobId: string) => textWorkbench.transcript(jobId));
   ipcMain.handle("text:supplement", (_event, jobId: string, startMs: number, endMs: number) => textWorkbench.supplement(jobId, startMs, endMs));
   ipcMain.handle("text:subtitle", async (_event, jobId: string) => {

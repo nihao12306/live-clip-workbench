@@ -6,8 +6,8 @@ export const topSixPrompt = `你负责最终文字选稿的相对择优排序。
 export async function chooseTopSix<T extends QualityCandidate>(candidates: T[],
   call: (prompt: string, input: unknown) => Promise<unknown>,
   cache?: { get: (key: string) => unknown; set: (key: string, value: unknown) => void },
-  context?: unknown): Promise<T[]> {
-  if (candidates.length <= MAX_TEXT_CANDIDATES) return candidates;
+  context?: unknown, reviewSmallSet = false): Promise<T[]> {
+  if (!candidates.length || !reviewSmallSet && candidates.length <= MAX_TEXT_CANDIDATES) return candidates;
   const key = createHash('sha256').update(JSON.stringify({ policy: topSixPrompt, candidates, context })).digest('hex');
   const schema = z.object({ selected: z.array(z.number().int().min(1).max(candidates.length)).max(MAX_TEXT_CANDIDATES) });
   for (let attempt = 0; attempt < 2; attempt++) {

@@ -24,6 +24,22 @@ describe('选题经验必须来自明确的人类反馈', () => {
     expect(buildSelectionLearning([j], j)?.selectionFeedback?.teacherExamples).toMatchObject([{ verdict: 'bad' }]);
     expect(buildSelectionLearning([j], sample('示例讲师乙', 'other'))).toBeUndefined();
   });
+  it('保留被暂不采用和原话不完整覆盖的旧选题评价，清除反馈后停止引用', () => {
+    const j = sample('示例讲师甲', 'restore', 'good');
+    const clip = j.clips[0];
+    const good = clip.topicFeedback!;
+    clip.topicFeedback = { ...good, verdict: 'deferred', reason: '以后做', updatedAt: '2026-11-09' };
+    clip.topicFeedbackHistory = [good, clip.topicFeedback];
+    const refs = vi.fn();
+    expect(buildSelectionLearning([j], j, '', [], refs)?.selectionFeedback?.teacherExamples).toMatchObject([{ verdict: 'good', reason: good.reason }]);
+    expect(refs).toHaveBeenCalledWith([{ jobId: j.id, clipId: clip.id, updatedAt: good.updatedAt }]);
+    clip.topicFeedback = { ...good, verdict: 'incomplete', reason: '没有讲为什么', updatedAt: '2026-11-10' };
+    clip.topicFeedbackHistory.push(clip.topicFeedback);
+    expect(buildSelectionLearning([j], j)?.selectionFeedback?.teacherExamples).toMatchObject([{ verdict: 'good', completenessNote: '没有讲为什么' }]);
+    clip.topicFeedbackHistory.push({ ...clip.topicFeedback, verdict: 'cleared' });
+    delete clip.topicFeedback;
+    expect(buildSelectionLearning([j], j)?.selectionFeedback).toBeUndefined();
+  });
   it('跨老师仅提供来自至少两位老师、两场回放的明确案例', () => {
     const context = buildSelectionLearning([sample('甲', 'one', 'good'), sample('乙', 'two', 'bad')], sample('丙', 'current'));
     expect(context?.selectionFeedback?.teacherExamples).toHaveLength(0);
@@ -50,6 +66,10 @@ it('初选和复审都思考，人工反馈前移；同条件复用，新反馈/
           coreQuestion: '怎么取舍', conclusion: '先看目标', reason: '原文提出冲突并给出判断框架', duplicateOf: null,
           evidence: [{ id: 'S1', quote: '只看学校名气' }, { id: 'S2', quote: '先看孩子的目标' }] })) };
       }
+      if (prompt.startsWith('你负责最终文字选稿')) {
+        expect(input.context.selectionLearning.selectionFeedback.teacherExamples).toMatchObject([{ verdict: 'bad' }]);
+        return { selected: [] };
+      }
       return { titles: [{ text: '选学校前先看目标' }], hooks: [{ id: 'S1' }], selectedHook: 0, body: [{ id: 'S2' }] };
     }) };
   const source = { identify: identifyTextSource, readTranscript: vi.fn(async () => ({ parts: units, cues: true })) };
@@ -70,6 +90,13 @@ it('初选和复审都思考，人工反馈前移；同条件复用，新反馈/
   expect(scans().at(-1)?.[1].selectionLearning.selectionFeedback.teacherExamples).toMatchObject([{ verdict: 'bad' }]);
   const reviewCall = model.textSelection.mock.calls.filter(([p]) => p.startsWith('你是直播短视频选题主编')).at(-1)!;
   expect(reviewCall[1].selectionLearning.selectionFeedback.teacherExamples).toMatchObject([{ verdict: 'bad' }]);
+  const rerun = app.list().find(j => j.id === third.id)!;
+  expect(rerun.clips).toHaveLength(0);
+  expect(rerun.topicFeedbackUses?.map(use => use.stage)).toEqual(['scan', 'review', 'final']);
+  expect(rerun.topicFeedbackUses?.at(-1)?.feedback).toMatchObject([{ jobId: first.id, clipId: original.clips[0].id }]);
+  const cached = app.retry(first.id);
+  await vi.waitFor(() => expect(app.list().find(j => j.id === cached.id)?.status).toBe('ready'));
+  expect(app.list().find(j => j.id === cached.id)?.topicFeedbackUses).toBeUndefined();
   modelName = 'different-model';
   const fourth = app.retry(first.id);
   await vi.waitFor(() => expect(app.list().find(j => j.id === fourth.id)?.status).toBe('ready'));

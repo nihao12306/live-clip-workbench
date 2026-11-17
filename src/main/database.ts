@@ -190,9 +190,9 @@ export class DatabaseService {
     return this.db;
   }
 
-  private persist(): void {
-    if (!this.db) return;
-    const data = this.db.export();
+  private persist(database = this.db): void {
+    if (!database) return;
+    const data = database.export();
     const tempPath = `${this.databasePath}.tmp`;
     fs.writeFileSync(tempPath, Buffer.from(data));
     fs.renameSync(tempPath, this.databasePath);
@@ -546,6 +546,25 @@ export class DatabaseService {
   setSetting<T>(key: string, value: T): void {
     this.database.run("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", [key, JSON.stringify(value)]);
     this.persist();
+  }
+
+  replaceAndRemoveSettings(updates: Record<string, unknown>, removedKeys: string[]): void {
+    const previous = this.database;
+    const next = new this.SQL!.Database(previous.export());
+    try {
+      for (const [key, value] of Object.entries(updates)) {
+        next.run("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", [key, JSON.stringify(value)]);
+      }
+      for (const key of removedKeys) next.run("DELETE FROM settings WHERE key = ?", [key]);
+      next.run("VACUUM");
+      this.persist(next);
+    } catch (error) {
+      next.close();
+      throw error;
+    }
+    next.run("PRAGMA foreign_keys = ON");
+    this.db = next;
+    previous.close();
   }
 
   private buildPerformanceReminders(

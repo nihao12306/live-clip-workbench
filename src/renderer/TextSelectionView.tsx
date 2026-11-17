@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { clipTime, editRanges, movedTextIds, originalMarks, readingOrder, textOf, textSourceLabels, topicVerdictLabels } from '../shared/text-selection';
-import type { TextClip, TextEdit, TextJob, TextJobInput, TextLearningSummary, TextPick, TextRange, TextUnit, TextTopicVerdict } from '../shared/text-selection';
+import { clipTime, editRanges, movedTextIds, originalMarks, readingOrder, savedTopicDisposition, savedTopicQuality, textOf, textSourceLabels, topicFeedbackStageLabels, topicVerdictLabels } from '../shared/text-selection';
+import type { TextClip, TextEdit, TextJob, TextJobInput, TextLearningSummary, TextPick, TextRange, TextUnit, TextTopicFeedback, TextTopicVerdict } from '../shared/text-selection';
 import { compareTextBody, finalVersionMatches } from '../shared/text-behavior';
 import { originalTextSource } from '../shared/text-selection';
 import type { TextFeishuExport } from '../shared/types';
@@ -50,7 +50,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
   const [linkTeachers, setLinkTeachers] = useState<Record<string, string>>({});
   const [newName, setNewName] = useState<string | null>(null);
   const [topicReason, setTopicReason] = useState('');
-  const [topicDisposition, setTopicDisposition] = useState<TextTopicVerdict>('deferred');
+  const [topicVerdict, setTopicVerdict] = useState<TextTopicVerdict | null>(null);
   const [finalNote, setFinalNote] = useState('');
   const [newTeacher, setNewTeacher] = useState('');
   const [jobId, setJobId] = useState('');
@@ -59,6 +59,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [historyNotice, setHistoryNotice] = useState('');
   const [exported, setExported] = useState<TextFeishuExport | null>(null);
   const [feishuFolder, setFeishuFolder] = useState('');
   const [destinations, setDestinations] = useState<Record<string, string>>({});
@@ -76,7 +77,9 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
   const saved = job?.clips.find(item => item.id === clipId) ?? job?.clips[0];
   const clip = draft?.id === saved?.id ? draft : saved;
   const delivery = job?.deliveries?.find(item => item.clipId === clip?.id);
-  useEffect(() => { setTopicReason(''); setTopicDisposition('deferred'); setFinalNote(''); }, [clip?.id]);
+  useEffect(() => { setTopicReason(''); setTopicVerdict(null); setFinalNote(''); }, [job?.id, clip?.id]);
+  const qualityFeedback = saved && savedTopicQuality(saved);
+  const dispositionFeedback = saved && savedTopicDisposition(saved);
   const comparison = clip?.initialEdit ? compareTextBody(clip, clip.initialEdit, clip) : undefined;
 
   useEffect(() => {
@@ -126,6 +129,15 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
     chooseJob(next[0].id);
   }
 
+  async function deleteJob(item: TextJob) {
+    setHistoryNotice('');
+    if (!await window.workbench.deleteTextJob(item.id)) return;
+    setJobs(previous => previous.filter(other => other.id !== item.id));
+    if (job?.id === item.id) chooseJob('');
+    setHistoryNotice('已删除场次和本地记录');
+    setLearning(await window.workbench.getTextLearningSummary());
+  }
+
   async function start(sources: TextJobInput[]) {
     addJobs(await window.workbench.startTextJobs(sources));
     setUrl('');
@@ -173,6 +185,37 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
     setDraft(next);
     setDirty(false);
     setJobs(previous => previous.map(item => item.id === job?.id ? { ...item, clips: item.clips.map(c => c.id === next.id ? next : c) } : item));
+  }
+
+  function updateTopicFeedback(next: TextClip) {
+    const feedback = { topicFeedback: next.topicFeedback, topicFeedbackHistory: next.topicFeedbackHistory };
+    setJobs(previous => previous.map(item => item.id === job?.id ? {
+      ...item, clips: item.clips.map(c => c.id === next.id ? { ...c, ...feedback } : c),
+    } : item));
+    setDraft(previous => previous?.id === next.id ? { ...previous, ...feedback } : previous);
+    setTopicVerdict(null);
+    setTopicReason('');
+  }
+
+  function feedbackStatus(feedback: TextTopicFeedback) {
+    const runs = jobs.flatMap(run => {
+      const receipts = run.topicFeedbackUses?.filter(use => use.feedback.some(ref =>
+        ref.jobId === job?.id && ref.clipId === saved?.id && ref.updatedAt === feedback.updatedAt)) ?? [];
+      return receipts.length ? [{ run, receipts }] : [];
+    });
+    const excluded = feedback.verdict === 'duplicate' || feedback.verdict === 'deferred';
+    return <div key={feedback.verdict} className="topic-feedback-record">
+      <p><b>已保存 · {topicVerdictLabels[feedback.verdict]}</b> · {feedback.reason}</p>
+      <p className="text-status">{excluded ? '这是处置记录，不参与选题质量学习。'
+        : `适用范围：${feedback.teacher || '未填老师，仅匹配同一回放'} · ${runs.length ? '已带入模型请求并收到回复' : '可作为候选样例，尚无实际调用回执'}`}</p>
+      {!!runs.length && <details><summary>查看学习回执（{runs.length} 次生成）</summary>
+        <ul>{runs.map(({ run, receipts }) => <li key={run.id}>
+          <b>{run.name || sourceLabel(run)} · {run.teacher || '未填老师'}</b>
+          {' · '}{receipts.map(use => `${topicFeedbackStageLabels[use.stage]}（${new Date(use.respondedAt).toLocaleString()}）`).join('、')}
+        </li>)}</ul>
+        <p className="text-status">回执确认反馈随请求发送且模型返回了内容，无法证明反馈改变了模型的决定。复用缓存不会生成新回执。</p>
+      </details>}
+    </div>;
   }
 
   async function save() {
@@ -230,6 +273,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
       <p className="text-status text-source-help">飞书妙记需要授权并允许导出逐字稿；千问链接须能取得带时间码的原文。</p>
     </form>
     {error && <p className="text-error" role="alert">{error}</p>}
+    {historyNotice && <p className="text-status" role="status">{historyNotice}</p>}
     {recent.length > 0 && <section className="panel text-panel">
       <h2>本次处理</h2>
       <div className="text-history">{recent.map(item => <div className="text-pending-row" key={item.id}>
@@ -273,11 +317,15 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
         <span><b>{item.name || item.teacher || sourceLabel(item)}</b> · {new Date(item.createdAt).toLocaleString()} · {item.clips.length} 条候选</span>
         <small>{item.clips.map(candidate => candidate.name).join('、') || item.message}</small>
         </button>
+        <div className="text-history-actions">
         <button type="button" className="button small" aria-label={'重新生成：' + (item.name || item.teacher || sourceLabel(item))}
           disabled={running >= 3 || busy || dirty || jobs.some(other => other.url === item.url && other.status === 'running')}
           onClick={() => void perform(async () => { addJobs([await window.workbench.retryTextJob(item.id)]); })}>
           {jobs.some(other => other.url === item.url && other.status === 'running') ? '正在生成…' : '重新生成'}
         </button>
+        <button type="button" className="button small danger" aria-label={'删除：' + (item.name || item.teacher || sourceLabel(item))}
+          disabled={busy || dirty} onClick={() => void perform(() => deleteJob(item))}>删除</button>
+        </div>
       </div>)}
       {!history.length && <p className="text-status">没有匹配的场次</p>}</div>
     </section>}
@@ -293,11 +341,8 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
         }}>{transcript ? '收起整场逐字稿' : job.transcriptCount ? '查看整场逐字稿' : '获取整场逐字稿'}</button>
         {job.status === 'failed' && <>
           <button className="button" disabled={running >= 3 || busy || dirty} onClick={() => void perform(async () => { addJobs([await window.workbench.retryTextJob(job.id)]); })}>重试此回放</button>
-          <button className="button ghost" disabled={busy || dirty} onClick={() => void perform(async () => {
-            await window.workbench.dismissTextJob(job.id);
-            setJobs(previous => previous.filter(item => item.id !== job.id));
-            chooseJob('');
-          })}>清除失败记录</button>
+          <button className="button small danger" disabled={busy || dirty}
+            onClick={() => void perform(() => deleteJob(job))}>删除失败记录</button>
           {!job.transcriptCount && <button className="button" disabled={running >= 3 || busy || dirty} onClick={() => void perform(async () => {
             const next = await window.workbench.importTextSubtitle(job.id);
             if (next) addJobs([next]);
@@ -323,6 +368,9 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
       {job.qualityAudit && <details><summary>本场质量复审 · 提名 {job.qualityAudit.proposed} 条，{job.qualityAudit.qualified === undefined ? '通过' : '择优生成'} {job.qualityAudit.approved} 条{job.qualityAudit.extraReview ? ' · 已跨题复核' : ''}{job.qualityAudit.reused ? ' · 复用同条件选题' : ''}</summary>
         <p className="text-status">每场最多6条进入逐条编稿；复审合格超过6条时先择优，避免逐条生成后再筛。通过表示模型初审，仍需人工审核。</p>
         <ul>{job.qualityAudit.decisions.map((item, i) => <li key={i}><b>{item.round ? item.round + ' · ' : ''}{item.approved ? '通过' : '未通过'} · {item.name}</b>：{item.watchReason && <span>观看价值：{item.watchReason}；</span>}{item.reason}</li>)}</ul>
+      </details>}
+      {!!job.topicFeedbackUses?.length && <details><summary>本场学习回执</summary>
+        <ul>{job.topicFeedbackUses.map((use, i) => <li key={i}>{topicFeedbackStageLabels[use.stage]} · 带入 {use.feedback.length} 条手动反馈并收到模型回复 · {new Date(use.respondedAt).toLocaleString()}</li>)}</ul>
       </details>}
       {job.transcriptSavedAt && <p className="text-status">整场原文已保存在本地 · {new Date(job.transcriptSavedAt).toLocaleString()}</p>}
       {job.source === 'feishu' && feishuMessage && <p className="text-status">{feishuMessage}</p>}
@@ -353,23 +401,41 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
         <button className="button small" disabled={textPage + 1 >= pages} onClick={() => setTextPage(textPage + 1)}>下一页</button></div>
     </section>}
     {clip && job?.status !== 'running' && <div className="panel text-panel">
-      <details open><summary>选题反馈 · 用于改善下一次初选与复审</summary>
-        <p className="text-status">只评价这条题目值不值得做；不是视频剪辑意见。请给具体理由，反馈会作为有依据的样例，不会把一次偏好扩成所有老师的规则。</p>
-        {clip.topicFeedback && <p className="text-status">已记录：{topicVerdictLabels[clip.topicFeedback.verdict]} · {clip.topicFeedback.reason}</p>}
-        <input aria-label="选题反馈原因" placeholder="例如：有真实就业冲突，值得展开；或只有报分数，没有值得看完的判断" maxLength={800} value={topicReason} onChange={e => setTopicReason(e.target.value)} />
+      <details open><summary>选题反馈与学习回执</summary>
+        <p className="text-status">先选「值得做」或「不值得做」，再写原因并保存。</p>
         <div className="text-controls">
-          {(['good', 'bad'] as const).map(verdict => <button type="button" className="button small" key={verdict} disabled={busy || dirty || !topicReason.trim()}
-            onClick={() => void perform(async () => { const updated = await window.workbench.rateTextTopic(job!.id, clip.id, verdict, topicReason); updateSaved(updated); setTopicReason(''); })}>{verdict === 'good' ? '选题值得做' : '选题不合适'}</button>)}
-        </div>
-        <div className="text-controls">
-          <select aria-label="未采用原因类别" value={topicDisposition} onChange={e => setTopicDisposition(e.target.value as TextTopicVerdict)}>
+          {(['good', 'bad'] as const).map(verdict => <button type="button" className={`button small${topicVerdict === verdict ? ' primary' : ''}`} key={verdict} disabled={busy}
+            aria-pressed={topicVerdict === verdict} onClick={() => { setTopicVerdict(verdict); setTopicReason(qualityFeedback?.verdict === verdict ? qualityFeedback.reason : ''); }}>{topicVerdictLabels[verdict]}</button>)}
+          <select aria-label="其他未采用原因" value={topicVerdict && !['good', 'bad'].includes(topicVerdict) ? topicVerdict : ''} disabled={busy}
+            onChange={e => {
+              const verdict = (e.target.value || null) as TextTopicVerdict | null;
+              setTopicVerdict(verdict);
+              setTopicReason(dispositionFeedback?.verdict === verdict ? dispositionFeedback.reason : '');
+            }}>
+            <option value="">记录其他未采用原因…</option>
             <option value="incomplete">题目好，但原话没讲完整</option><option value="duplicate">已做过或重复</option><option value="deferred">暂时不采用</option>
           </select>
-          <button type="button" className="button small" disabled={busy || dirty || (topicDisposition === 'incomplete' && !topicReason.trim())}
-            onClick={() => void perform(async () => { updateSaved(await window.workbench.rateTextTopic(job!.id, clip.id, topicDisposition, topicReason.trim() || (topicDisposition === 'duplicate' ? '已做过，本期不重复采用' : '暂时不采用，未补充具体原因'))); setTopicReason(''); })}>记录未采用原因</button>
-          {clip.topicFeedback && <button type="button" className="button small" disabled={busy || dirty} onClick={() => void perform(async () => { updateSaved(await window.workbench.clearTextTopicFeedback(job!.id, clip.id)); setTopicReason(''); })}>清除反馈／尚未决定</button>}
         </div>
-        <p className="text-status">未导出和未查看不算负评。“原话不完整”不否定题目本身；重复和暂不采用只记录用途，不参与选题质量学习。</p>
+        {topicVerdict && <form key={topicVerdict} onSubmit={e => {
+          e.preventDefault();
+          const reason = topicReason.trim();
+          if (!reason || busy) return;
+          void perform(async () => updateTopicFeedback(await window.workbench.rateTextTopic(job!.id, clip.id, topicVerdict, reason)));
+        }}>
+          <label>{topicVerdictLabels[topicVerdict]}的原因
+            <input autoFocus aria-label="选题反馈原因" placeholder="例如：只有报分数，没有解释怎么选" maxLength={800} value={topicReason} onChange={e => setTopicReason(e.target.value)} />
+          </label>
+          <div className="text-controls">
+            <button className="button small primary" type="submit" disabled={busy || !topicReason.trim()}>保存反馈</button>
+            <button className="button small" type="button" disabled={busy} onClick={() => { setTopicVerdict(null); setTopicReason(''); }}>取消</button>
+          </div>
+        </form>}
+        <div role="status">
+          {qualityFeedback && feedbackStatus(qualityFeedback)}
+          {dispositionFeedback && feedbackStatus(dispositionFeedback)}
+        </div>
+        {(qualityFeedback || dispositionFeedback) && <button type="button" className="button small" disabled={busy}
+          onClick={() => void perform(async () => updateTopicFeedback(await window.workbench.clearTextTopicFeedback(job!.id, clip.id)))}>清除本条反馈</button>}
       </details>
       <details><summary>模型初稿与当前稿 · 完整正文对比</summary>
         <p className="text-status">逐段保留初稿与当前稿，标明删选、补回和顺序变化。记录行为，不凭空判断你的修改动机。</p>

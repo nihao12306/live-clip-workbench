@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { qualityPrompt, screenTextCandidates } from './text-quality-gate';
 import { editRanges, originalTextSource, readingOrder } from '../shared/text-selection';
-import type { TextClip, TextEdit, TextJob, TextJobInput, TextPick, TextRange, TextUnit, TextTopicVerdict } from '../shared/text-selection';
+import type { TextClip, TextEdit, TextJob, TextJobInput, TextPick, TextRange, TextUnit, TextTopicVerdict, TopicFeedbackRef, TopicFeedbackStage } from '../shared/text-selection';
 import type { DatabaseService } from './database';
 import type { DeepSeekModelAdapter } from './model-adapter';
 import type { TextSources } from './text-sources';
@@ -127,7 +127,7 @@ export class TextWorkbench {
   private readonly currentTranscripts = new Map<string, TextUnit[]>();
   private readonly subtitleFiles = new Map<string, string>();
 
-  constructor(private readonly database: Pick<DatabaseService, 'getSetting' | 'setSetting'> & Partial<Pick<DatabaseService, 'listAccounts'>>,
+  constructor(private readonly database: Pick<DatabaseService, 'getSetting' | 'setSetting'> & Partial<Pick<DatabaseService, 'listAccounts' | 'replaceAndRemoveSettings'>>,
     private readonly source: Pick<TextSources, 'identify' | 'readTranscript'>,
     private readonly model: Pick<DeepSeekModelAdapter, 'textSelection'> & Partial<Pick<DeepSeekModelAdapter, 'getSelectionIdentity'>>) {
     const pending = database.getSetting<Array<{ job: TextJob; subtitleFile?: string }>>(pendingKey, []);
@@ -145,11 +145,15 @@ export class TextWorkbench {
 
   private stored(): TextJob[] { return this.database.getSetting<TextJob[]>(key, []); }
 
-  private savePending() {
-    this.database.setSetting(pendingKey, [...this.current.values()].map(job => ({
+  private pendingJobs(excludeId?: string) {
+    return [...this.current.values()].filter(job => job.id !== excludeId).map(job => ({
       job: { ...job, clips: [] },
       subtitleFile: this.subtitleFiles.get(job.id),
-    })));
+    }));
+  }
+
+  private savePending() {
+    this.database.setSetting(pendingKey, this.pendingJobs());
   }
 
   list(): TextJob[] {
@@ -253,6 +257,27 @@ export class TextWorkbench {
     this.currentTranscripts.delete(jobId);
     this.subtitleFiles.delete(jobId);
     this.savePending();
+  }
+
+  delete(jobId: string): void {
+    const job = this.find(jobId);
+    if (job.status === 'running' || this.active.has(jobId) || this.pendingTranscripts.has(jobId)) {
+      throw new Error('这场直播正在处理，请完成后再删除');
+    }
+    if (!this.database.replaceAndRemoveSettings) throw new Error('当前数据库不支持删除历史记录');
+
+    const sourceKey = sourceCacheKey(job.url);
+    const removedKeys = [`text-source:${jobId}`];
+    if (!this.list().some(other => other.id !== jobId && sourceCacheKey(other.url) === sourceKey)) {
+      removedKeys.push(sourceKey);
+    }
+    this.database.replaceAndRemoveSettings({
+      [key]: this.stored().filter(item => item.id !== jobId),
+      [pendingKey]: this.pendingJobs(jobId),
+    }, removedKeys);
+    this.current.delete(jobId);
+    this.currentTranscripts.delete(jobId);
+    this.subtitleFiles.delete(jobId);
   }
 
   retry(jobId: string, subtitleFile?: string) {
@@ -379,14 +404,27 @@ export class TextWorkbench {
       }
     }
     job.transcriptCount = units.length;
-    const qualified = await this.chooseCandidates(job, units);
-    if (qualified.length > MAX_TEXT_CANDIDATES) { job.message = '正在从合格话题中择优，最多生成6条文字初稿'; this.persist(job); }
+    let feedback: TopicFeedbackRef[] = [];
+    const selectionLearning = buildSelectionLearning(this.stored(), job, '', this.database.listAccounts?.() ?? [], refs => { feedback = refs; });
+    const select = async (stage: TopicFeedbackStage, prompt: string, input: unknown, effort: 'low' | 'high' = 'high') => {
+      const result = await this.model.textSelection(prompt, input, 'analysis', effort);
+      if (feedback.length && !job.topicFeedbackUses?.some(use => use.stage === stage && JSON.stringify(use.feedback) === JSON.stringify(feedback))) {
+        job.topicFeedbackUses = [...(job.topicFeedbackUses ?? []), { stage, respondedAt: new Date().toISOString(), feedback }];
+        this.savePending();
+      }
+      return result;
+    };
+    const qualified = await this.chooseCandidates(job, units, selectionLearning, select);
+    if (qualified.length > MAX_TEXT_CANDIDATES || qualified.length && feedback.length) {
+      job.message = '正在从合格话题中择优，最多生成6条文字初稿';
+      this.persist(job);
+    }
     const rankingContext = { teacher: job.teacher, model: await this.model.getSelectionIdentity?.(),
-      selectionLearning: buildSelectionLearning(this.stored(), job, '', this.database.listAccounts?.() ?? []) };
-    const candidates = (await chooseTopSix(qualified, (prompt, input) => this.model.textSelection(prompt, input, 'analysis', 'high'), {
+      selectionLearning };
+    const candidates = (await chooseTopSix(qualified, (prompt, input) => select('final', prompt, input), {
       get: hash => this.database.getSetting('text-top-six:' + hash, undefined),
       set: (hash, value) => this.database.setSetting('text-top-six:' + hash, value),
-    }, rankingContext)).slice(0, MAX_TEXT_CANDIDATES);
+    }, rankingContext, feedback.length > 0)).slice(0, MAX_TEXT_CANDIDATES);
     if (job.qualityAudit) job.qualityAudit = { ...job.qualityAudit, qualified: qualified.length, approved: candidates.length, outputLimit: MAX_TEXT_CANDIDATES };
     const failures: string[] = [];
     job.failureStage = '整理候选';
@@ -403,13 +441,13 @@ export class TextWorkbench {
     job.status = failures.length && !job.clips.length ? 'failed' : 'ready';
     if (job.status === 'ready') delete job.failureStage;
     job.message = job.clips.length ? `已生成 ${job.clips.length} 条候选${failures.length ? `，${failures.length} 条未通过原话校验` : ''}`
-      : failures.length ? `候选处理未完成：${failures.join('；')}` : '本场提名未通过严格质量复审，未继续逐条编稿；整场原文已保留' ;
+      : failures.length ? `候选处理未完成：${failures.join('；')}` : qualified.length ? '最终择优未保留候选，整场原文已保留' : '本场提名未通过严格质量复审，未继续逐条编稿；整场原文已保留';
     this.persist(job);
     if (job.status === 'failed') this.savePending();
   }
 
-  private async chooseCandidates(job: TextJob, units: TextUnit[]): Promise<Candidate[]> {
-    const selectionLearning = buildSelectionLearning(this.stored(), job, '', this.database.listAccounts?.() ?? []);
+  private async chooseCandidates(job: TextJob, units: TextUnit[], selectionLearning: ReturnType<typeof buildSelectionLearning>,
+    select: (stage: TopicFeedbackStage, prompt: string, input: unknown, effort?: 'low' | 'high') => Promise<unknown>): Promise<Candidate[]> {
     const modelIdentity = await this.model.getSelectionIdentity?.() ?? { model: 'test-model', baseUrl: '' };
     const fingerprint = createHash('sha256').update(JSON.stringify({ policy: 'audience-value-v2', scanPrompt, qualityPrompt,
       units, source: new URL(job.url).origin + new URL(job.url).pathname, teacher: job.teacher?.trim().normalize() ?? '', selectionLearning, modelIdentity, thinking: 'scan-low-review-high' })).digest('hex');
@@ -436,13 +474,13 @@ export class TextWorkbench {
         const items = z.object({ candidates: z.array(candidateSchema) }).parse(raw).candidates;
         for (const candidate of items) candidateUnits(window, candidate);
         return items;
-      });
+      }, (prompt, input, effort) => select('scan', prompt, input, effort));
       this.database.setSetting(scanKey, candidates);
       shortlist.push(...candidates);
     }
 
     const screened = await screenTextCandidates(shortlist, units,
-      (prompt, input) => this.model.textSelection(prompt, input, 'analysis', 'high'),
+      (prompt, input) => select('review', prompt, input),
       message => { job.message = message; this.persist(job); }, {
         get: hash => this.database.getSetting(`text-quality-batch:${fingerprint}:${hash}`, undefined)
           ?? this.database.getSetting(`text-quality-batch:${job.id}:${hash}`, undefined),
@@ -455,19 +493,20 @@ export class TextWorkbench {
     return screened.candidates;
   }
 
-  private async validatedSelection<T>(job: TextJob, prompt: string, input: unknown, validate: (raw: unknown) => T): Promise<T> {
+  private async validatedSelection<T>(job: TextJob, prompt: string, input: unknown, validate: (raw: unknown) => T,
+    select: (prompt: string, input: unknown, effort?: 'low' | 'high') => Promise<unknown>): Promise<T> {
     let previousOutput: unknown;
     try {
-      previousOutput = await this.model.textSelection(prompt, input, 'analysis', 'low');
+      previousOutput = await select(prompt, input, 'low');
       return validate(previousOutput);
     } catch (error) {
       if (!(error instanceof z.ZodError || error instanceof SyntaxError || error instanceof Error && error.message === candidateRangeError)) throw error;
       const detail = error instanceof z.ZodError ? error.issues.slice(0, 5).map(issue => issue.path.join('.')).join('、') : 'JSON 格式或原文位置';
       job.message = '模型输出缺字段或时间范围有误，正在重试当前阶段';
       try {
-        return validate(await this.model.textSelection(
+        return validate(await select(
           `${prompt}\n请修复上一份输出。每条候选都必须有 name、startId、endId、topicValue、completeness，其中 completeness 必须引用本场证据说明讲完整了什么。不设数量配额；只保留值得制作且完整的题。只返回符合当前任务要求的完整 JSON。`,
-          { source: input, previousOutput, requiredCorrections: detail }, 'analysis'));
+          { source: input, previousOutput, requiredCorrections: detail }));
       } catch (retryError) {
         if (retryError instanceof z.ZodError || retryError instanceof SyntaxError || retryError instanceof Error && retryError.message === candidateRangeError) {
           throw new Error(`DeepSeek 两次返回的选题格式不符合要求，请重试。检查项：${detail}`);
@@ -517,8 +556,12 @@ export class TextWorkbench {
     if (!['good', 'bad', 'incomplete', 'duplicate', 'deferred'].includes(verdict)) throw new Error('请选择有效的采用或未采用原因');
     reason = reason.trim();
     if (!reason || reason.length > 800) throw new Error('请填写选题判断的具体原因，最多800字');
+    const history = [...(clip.topicFeedbackHistory ?? [])];
+    if (clip.topicFeedback && !history.some(item => item.updatedAt === clip.topicFeedback!.updatedAt && item.verdict === clip.topicFeedback!.verdict)) {
+      history.push(clip.topicFeedback);
+    }
     clip.topicFeedback = { verdict, reason, teacher: job.teacher?.trim().normalize() ?? '', updatedAt: new Date().toISOString() };
-    clip.topicFeedbackHistory = [...(clip.topicFeedbackHistory ?? []), { ...clip.topicFeedback }];
+    clip.topicFeedbackHistory = [...history, clip.topicFeedback];
     this.persist(job);
     return clip;
   }

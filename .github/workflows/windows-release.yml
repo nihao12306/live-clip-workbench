@@ -2,6 +2,7 @@ name: Windows x64 installer
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -92,6 +93,7 @@ jobs:
           compression-level: 0
 
   attach:
+    if: github.event_name == 'workflow_dispatch'
     needs: windows
     runs-on: ubuntu-latest
     permissions:
