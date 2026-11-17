@@ -119,9 +119,8 @@ jobs:
           }
           release_id="$(find_release_id)"
           if [ -z "$release_id" ]; then
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --verify-tag --draft --title "直播切片工作台 $version · Windows 和 macOS" --notes-file release-notes.md
-            release_id="$(find_release_id)"
+            release_id="$(gh api --method POST "$releases" -F draft=true -f tag_name="$GITHUB_REF_NAME" \
+              -f name="直播切片工作台 $version · Windows 和 macOS" -f body="$(cat release-notes.md)" --jq .id)"
           fi
           test -n "$release_id"
           release="$releases/$release_id"

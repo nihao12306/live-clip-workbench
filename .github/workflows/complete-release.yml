@@ -61,9 +61,9 @@ jobs:
           }
           id="$(find_release)"
           if [ -z "$id" ]; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
-              --title "直播切片工作台 $version" --notes-file release-notes.md
-            id="$(find_release)"
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .ref
+            id="$(gh api --method POST "$releases" -F draft=true -f tag_name="$TAG" \
+              -f name="直播切片工作台 $version" -f body="$(cat release-notes.md)" --jq .id)"
           fi
           test -n "$id"
           filter=".[] | select(.name == \"$file\" and .state == \"uploaded\") | .digest"
