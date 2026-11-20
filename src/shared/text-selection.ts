@@ -48,7 +48,7 @@ export type TextLearningSummary = {
   general: { teachers: number; replays: number; rules: string[] };
   teachers: Array<{ teacher: string; replays: number; rules: string[]; examples: TextLearningExample[] }>;
 };
-export type TextJobInput = { url: string; name?: string; teacher?: string };
+export type TextJobInput = { url: string; name?: string; teacher?: string; sessionTopic?: string };
 export type TextJob = {
   id: string;
   /** Normalized address used to fetch and deduplicate sources. */
@@ -63,6 +63,7 @@ export type TextJob = {
   source?: TextSourceKind;
   transcriptCount?: number;
   transcriptSavedAt?: string;
+  sessionTopic?: string;
   teacher?: string;
   deliveries?: TextDelivery[];
   topicFeedbackUses?: TopicFeedbackUse[];

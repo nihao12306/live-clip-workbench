@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { compareTextBody, finalVersionMatches } from '../shared/text-behavior';
 import { readingOrder } from '../shared/text-selection';
 import type { TextClip, TextEdit, TextJob, TextLearningExample, TextLearningSummary, TextPick } from '../shared/text-selection';
@@ -41,7 +42,8 @@ function removedText(clip: TextClip, before: TextEdit, after: TextEdit): string[
 
 function sameReplay(job: TextJob) {
   const parsed = new URL(job.url);
-  return job.source === 'qianwen' ? parsed.href : parsed.origin + parsed.pathname;
+  const identity = job.source === 'qianwen' ? parsed.href : parsed.origin + parsed.pathname;
+  return createHash('sha256').update(identity).digest('hex');
 }
 
 function sampleFor(job: TextJob, clip: TextClip) {
@@ -82,7 +84,16 @@ function grams(text: string) {
   return new Set(characters.slice(1).map((char, index) => characters[index] + char));
 }
 
-type Sample = NonNullable<ReturnType<typeof sampleFor>>;
+export type TextLearningSample = NonNullable<ReturnType<typeof sampleFor>>;
+type Sample = TextLearningSample;
+
+export function confirmedTextLearningSamples(job: TextJob): TextLearningSample[] {
+  return job.clips.flatMap(clip => {
+    if (!clip.confirmedFinal) return [];
+    const sample = sampleFor(job, clip);
+    return sample?.confirmation ? [sample] : [];
+  });
+}
 const replayCount = (samples: Sample[]) => new Set(samples.map(sample => sample.replay)).size;
 const teacherCount = (samples: Sample[]) => new Set(samples.map(sample => sample.teacher)).size;
 const allRules = Object.keys(rules) as Rule[];
@@ -118,11 +129,12 @@ function teacherExperience(samples: Sample[], general: Rule[], topic = '') {
   return { replays: replayCount(samples), rules: personalRules, examples };
 }
 
-export function buildTextLearning(jobs: TextJob[], job?: TextJob, topic = '') {
-  const samples = jobs.flatMap(item => item.clips.flatMap(clip => {
+export function buildTextLearning(jobs: TextJob[], job?: TextJob, topic = '', retained: TextLearningSample[] = []) {
+  const current = jobs.flatMap(item => item.clips.flatMap(clip => {
     const sample = sampleFor(item, clip);
     return sample ? [sample] : [];
-  })).sort((a, b) => b.exportedAt.localeCompare(a.exportedAt)).slice(0, 80);
+  }));
+  const samples = [...current, ...retained].sort((a, b) => b.exportedAt.localeCompare(a.exportedAt)).slice(0, 80);
   const history = job ? samples.filter(sample => sample.replay !== sameReplay(job) || sample.confirmation) : samples;
   const knownHistory = history.filter(sample => sample.teacher);
   const general = generalRules(knownHistory);

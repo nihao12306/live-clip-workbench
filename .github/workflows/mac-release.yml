@@ -79,6 +79,8 @@ jobs:
 
   windows:
     uses: ./.github/workflows/windows-release.yml
+    with:
+      media_baseline: v0.1.78
 
   release:
     name: Publish verified installers
@@ -106,8 +108,9 @@ jobs:
           - Windows x64 下载 EXE 安装程序。
           - Mac Apple 芯片（M 系列）下载 arm64 DMG，将工作台拖入「应用程序」。
 
-          文字选稿支持先选「值得做」或「不值得做」，再填写理由并保存。学习回执记录哪些反馈实际随初选、复审和最终择优请求发送并收到模型回复。
-          场次历史可删除单条记录和对应的本机稿件及逐字稿。
+          - 回放可选填「本场主题」。工作台优先关注主题相关好题，主题外的优质内容也能入选。
+          - 优先使用本段及相邻原话。远处的原话确实能补齐或明显改善好题时，才组合；组合失败会继续处理普通候选。
+          - 删除回放默认保留已确认的改稿经验，也可勾选同时清除。
 
           社区版使用 GitHub Releases 检查更新。收到提醒后可在应用内下载并打开 DMG。
           Mac 安装包未做 Apple Developer ID 签名或公证。

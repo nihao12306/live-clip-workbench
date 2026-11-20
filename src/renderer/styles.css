@@ -4329,6 +4329,7 @@ nav button.active:hover,
 .text-workbench .text-source-names { flex: 1 1 100%; display: grid; gap: 6px; }
 .text-workbench .text-source-fields { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; }
 .text-workbench .text-source-fields > label { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.text-workbench .text-source-fields > .text-session-topic { grid-column: 1 / -1; }
 .text-workbench .text-source-fields > label > input { flex: 1; min-width: 0; }
 .text-workbench .text-teacher-learning { margin-top: 8px; }
 .text-workbench .text-learning-example { margin: 10px 0 0 12px; }

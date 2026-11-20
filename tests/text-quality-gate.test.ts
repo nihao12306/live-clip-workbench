@@ -8,6 +8,7 @@ const candidates = (n: number): QualityCandidate[] => Array.from({ length: n }, 
   startId: 'S' + (i * 2 + 1), endId: 'S' + (i * 2 + 2), topicValue: '自荐价值', completeness: '自称完整' }));
 function pass(entry: any) {
   return { number: entry.number, promise: entry.name, watchReason: '真实取舍冲突有判断增量', valueType: 'decision', watchValue: true, standalone: true, complete: true,
+    crossSpanJustified: entry.crossSpan ? true : undefined,
     coreQuestion: entry.name, conclusion: '有条件的结论', reason: '原文同时交代对象条件与推导理由', duplicateOf: null,
     evidence: [{ id: entry.units[0].id, quote: '问题有具体条件' }, { id: entry.units.at(-1).id, quote: '结论有明确理由' }] };
 }
@@ -102,3 +103,56 @@ it('后续复审批次断线时，重试复用前面已完成的批次', async (
   expect(call).toHaveBeenCalledTimes(3);
   expect(saved.size).toBe(2);
 });
+
+it.each([
+  { sessionTopic: '专业怎么选', request: true, justified: true },
+  { sessionTopic: undefined, request: true, justified: true },
+  { sessionTopic: '专业怎么选', request: false, justified: false },
+  { sessionTopic: undefined, request: true, justified: false },
+  { sessionTopic: '专业怎么选', request: true, justified: false, invalidSupport: true },
+])('按补全请求和复审判断跨段，输入为 %j', async ({ sessionTopic, request, justified, invalidSupport }) => {
+  const state = new Map<string, unknown>();
+  const db = { getSetting: <T>(key: string, fallback: T) => structuredClone(state.get(key)) as T ?? fallback,
+    setSetting: (key: string, value: unknown) => { state.set(key, structuredClone(value)); } };
+  const parts = [units[0], units[1], units[2], units[3]].map((unit, i) => ({
+    ...unit, startMs: [0, 1000, 2000, 65 * 60000][i], endMs: [1000, 2000, 3000, 65 * 60000 + 1000][i],
+  }));
+  const ordinary = { ...candidates(1)[0], name: '主题外好题', startId: 'S2', endId: 'S3' };
+  const themed = { ...candidates(1)[0], name: '跨段主题题', startId: 'S1', endId: 'S4', unitIds: ['S1', 'S4'] };
+  const model = { textSelection: vi.fn(async (prompt: string, input: any) => {
+    if (prompt.startsWith('你是直播短视频选题编辑')) {
+      expect(input.sessionTopic).toBe(sessionTopic);
+      return input.units[0].id === 'S1' ? { candidates: [ordinary], crossSpanRequests: request ? [{ startId: 'S1', endId: 'S1', reason: 'missing', value: '解释常见的专业选择困惑', gap: '缺判断依据' }] : [] }
+        : { candidates: [], supportUnitIds: ['S4'] };
+    }
+    if (prompt.startsWith('你是直播切片编辑')) {
+      expect(request).toBe(true);
+      const source = input.source ?? input;
+      expect(source.anchors[0].gap).toBe('缺判断依据');
+      expect(source.supportUnits.map((unit: any) => unit.id)).toEqual(['S4']);
+      return { candidates: [{ ...themed, anchor: 1, support: { id: 'S4', quote: invalidSupport ? '不存在的原话' : '结论有明确理由' } }] };
+    }
+    if (prompt.startsWith('你是直播短视频选题主编')) return { decisions: input.candidates.map((entry: any) => ({ ...pass(entry), crossSpanJustified: entry.crossSpan ? justified : undefined })) };
+    if (prompt.startsWith('你负责最终文字选稿')) {
+      expect(input.context.sessionTopic).toBe(sessionTopic);
+      return { selected: input.candidates.map((candidate: any) => candidate.number) };
+    }
+    return { titles: [{ text: input.candidate.name }], hooks: [{ id: input.units[0].id }],
+      selectedHook: 0, body: [{ id: input.units.at(-1).id }] };
+  }) };
+  const source = { identify: identifyTextSource, readTranscript: vi.fn(async () => ({ parts, cues: true })) };
+  const app = new TextWorkbench(db, source, model);
+  const [job] = app.start([{ url: 'https://tingwu.aliyun.com/doc/transcripts/session-topic', sessionTopic: sessionTopic && ` ${sessionTopic} ` }]);
+  await vi.waitFor(() => expect(app.list().find(item => item.id === job.id)?.status).toBe('ready'));
+  const result = app.list().find(item => item.id === job.id)!;
+  expect(result.sessionTopic).toBe(sessionTopic);
+  if (invalidSupport) {
+    expect(model.textSelection.mock.calls.filter(([prompt]) => prompt.startsWith('你是直播切片编辑'))).toHaveLength(2);
+    expect(result.qualityAudit?.decisions).toContainEqual(expect.objectContaining({ name: '跨段补充', approved: false }));
+  }
+  expect(result.clips.map(clip => ({ name: clip.name, ids: clip.units.map(unit => unit.id) }))).toEqual([
+    ...(justified ? [{ name: '跨段主题题', ids: ['S1', 'S4'] }] : []), { name: '主题外好题', ids: ['S2', 'S3'] },
+  ]);
+  expect(app.retry(job.id).sessionTopic).toBe(sessionTopic);
+  await vi.waitFor(() => expect(app.list().every(item => item.status === 'ready')).toBe(true));
+}, 5000);

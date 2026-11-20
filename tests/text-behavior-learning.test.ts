@@ -13,12 +13,16 @@ function setup(model: any = {}, source: any = {}) {
     body: [{ id: 'S2', ranges: [[0, 8] as [number, number]] }] };
   const clip: TextClip = { ...structuredClone(initial), id: 'c', name: '解释清楚选择依据', topicValue: '共同困惑', completeness: '理由清楚', units,
     titles: ['模型标题'], hooks: [], notes: [], initialEdit: structuredClone(initial) };
-  const job: TextJob = { id: 'j', name: '直播', teacher: '示例讲师甲', url: 'https://tingwu.aliyun.com/doc/transcripts/behavior', source: 'tingwu', status: 'ready', createdAt: '', message: '', clips: [clip] };
+  const job: TextJob = { id: 'j', name: '直播', teacher: '苗老师', url: 'https://tingwu.aliyun.com/doc/transcripts/behavior', source: 'tingwu', status: 'ready', createdAt: '', message: '', clips: [clip] };
   state.set('text-selection-jobs-v1', [job]);
   const database = { getSetting: <T>(k: string, fallback: T) => structuredClone(state.get(k)) as T ?? fallback,
-    setSetting: (k: string, v: unknown) => { state.set(k, structuredClone(v)); } };
+    setSetting: (k: string, v: unknown) => { state.set(k, structuredClone(v)); },
+    replaceAndRemoveSettings: (updates: Record<string, unknown>, removed: string[]) => {
+      for (const [key, value] of Object.entries(updates)) state.set(key, structuredClone(value));
+      for (const key of removed) state.delete(key);
+    } };
   const app = new TextWorkbench(database, source, model);
-  return { app, clip, job, state };
+  return { app, clip, job, state, database };
 }
 describe('完整正文行为与定稿版本', () => {
   it('记录保留、删除、补回、顺序；完整前后正文不截断', () => {
@@ -52,9 +56,32 @@ describe('完整正文行为与定稿版本', () => {
     expect(app.learningSummary().confirmedFinals).toBe(0);
     expect(app.list()[0].clips[0].finalHistory).toHaveLength(2);
   });
+  it.each([false, true])('删除回放时是否同时清除已确认经验：%s', (removeLearning) => {
+    const { app, clip, job, state, database } = setup();
+    state.set('text-source:j', [...units, { id: 'S99', startMs: 90000, endMs: 91000, text: '无关整场转写' }]);
+    app.save('j', 'c', { ...clip, body: [{ id: 'S3', ranges: [[0, 9]] }, ...clip.body] });
+    app.confirmFinal('j', 'c', '补回条件再解释案例');
+    app.delete('j', removeLearning);
+
+    const restarted = new TextWorkbench(database, {} as any, {} as any);
+    expect(restarted.list()).toEqual([]);
+    expect(state.has('text-source:j')).toBe(false);
+    expect(restarted.learningSummary().confirmedFinals).toBe(removeLearning ? 0 : 1);
+    const retained = state.get('text-confirmed-learning-retained-v1') as Parameters<typeof buildTextLearning>[3];
+    if (removeLearning) {
+      expect(retained).toBeUndefined();
+      return;
+    }
+    const next = { ...job, id: 'next', url: job.url + '-next' };
+    const context = buildTextLearning([], next, '', retained).context;
+    expect(context?.teacherExperience?.examples[0].note).toBe('补回条件再解释案例');
+    expect(context?.teacherExperience?.examples[0].body?.after.map(part => part.id)).toEqual(['S3', 'S2']);
+    expect(JSON.stringify(retained)).not.toContain('无关整场转写');
+    expect(JSON.stringify(retained)).not.toContain(job.url);
+  });
   it('导出不冒充明确定稿；同步记录传出的实际快照，失败不覆盖成功快照', () => {
     const { app, clip } = setup();
-    app.recordDelivery('j', 'c', '示例讲师甲', clip, { documentId: 'doc' });
+    app.recordDelivery('j', 'c', '苗老师', clip, { documentId: 'doc' });
     expect(app.list()[0].clips[0].confirmedFinal).toBeUndefined();
     expect(app.list()[0].clips[0].lastExport?.edit.title).toBe('模型标题');
     app.confirmFinal('j', 'c', '无需修改也认可');
@@ -69,7 +96,7 @@ describe('完整正文行为与定稿版本', () => {
   it('更换老师后必须重新确认，避免将前一位老师的定稿套到新老师', () => {
     const { app } = setup();
     app.confirmFinal('j', 'c');
-    app.rename('j', '直播', '示例讲师乙');
+    app.rename('j', '直播', '周老师');
     expect(app.list()[0].clips[0].confirmedFinal?.status).toBe('outdated');
   });
 });
@@ -90,7 +117,7 @@ describe('采用与未采用的原因分开学习', () => {
   it('曾导出只作为弱采用事实，明确反馈优先；无导出无反馈时不推断负评', () => {
     const { app, clip } = setup();
     expect(buildSelectionLearning(app.list(), app.list()[0])).toBeUndefined();
-    app.recordDelivery('j', 'c', '示例讲师甲', clip, { documentId: 'doc' });
+    app.recordDelivery('j', 'c', '苗老师', clip, { documentId: 'doc' });
     expect(buildSelectionLearning(app.list(), app.list()[0])?.selectionFeedback?.teacherExamples[0]).toMatchObject({ verdict: 'adopted', scope: expect.stringContaining('不是明确质量认可') });
     app.rateTopic('j', 'c', 'bad', '后来发现选题价值不足');
     expect(buildSelectionLearning(app.list(), app.list()[0])?.selectionFeedback?.teacherExamples[0]).toMatchObject({ verdict: 'bad' });
@@ -101,11 +128,11 @@ it('最新撤销或暂不用决定会覆盖同源旧副本的负评，不使旧�
   const { job } = setup();
   const old = structuredClone(job);
   old.id = 'old';
-  old.clips[0].topicFeedback = { verdict: 'bad', reason: '旧的负评', teacher: '示例讲师甲', updatedAt: '2026-01-01' };
+  old.clips[0].topicFeedback = { verdict: 'bad', reason: '旧的负评', teacher: '苗老师', updatedAt: '2026-01-01' };
   const current = structuredClone(job);
-  current.clips[0].topicFeedbackHistory = [{ verdict: 'cleared', reason: '撤销', teacher: '示例讲师甲', updatedAt: '2026-02-01' }];
+  current.clips[0].topicFeedbackHistory = [{ verdict: 'cleared', reason: '撤销', teacher: '苗老师', updatedAt: '2026-02-01' }];
   expect(buildSelectionLearning([old, current], current)).toBeUndefined();
-  current.clips[0].topicFeedback = { verdict: 'deferred', reason: '本期不用，不是不好', teacher: '示例讲师甲', updatedAt: '2026-03-01' };
+  current.clips[0].topicFeedback = { verdict: 'deferred', reason: '本期不用，不是不好', teacher: '苗老师', updatedAt: '2026-03-01' };
   expect(buildSelectionLearning([old, current], current)).toBeUndefined();
 });
 
@@ -132,7 +159,7 @@ it('完整确认案例实际进入下一次文字初稿请求，模型合理调�
   const { app, clip } = setup(model, source);
   app.save('j', 'c', { ...clip, body: [...clip.body, { id: 'S3', ranges: [[0, 9]] }] });
   app.confirmFinal('j', 'c', '保留条件解释完整');
-  const [next] = app.start([{ url: 'https://tingwu.aliyun.com/doc/transcripts/next-behavior', teacher: '示例讲师甲' }]);
+  const [next] = app.start([{ url: 'https://tingwu.aliyun.com/doc/transcripts/next-behavior', teacher: '苗老师' }]);
   await vi.waitFor(() => expect(app.list().find(j => j.id === next.id)?.status).toBe('ready'));
   expect(app.list().find(j => j.id === next.id)?.clips[0].body.map(p => p.id)).toEqual(['S3', 'S2']);
 });

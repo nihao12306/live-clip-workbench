@@ -47,6 +47,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
   const [learning, setLearning] = useState<TextLearningSummary>();
   const [url, setUrl] = useState('');
   const [linkNames, setLinkNames] = useState<Record<string, string>>({});
+  const [linkTopics, setLinkTopics] = useState<Record<string, string>>({});
   const [linkTeachers, setLinkTeachers] = useState<Record<string, string>>({});
   const [newName, setNewName] = useState<string | null>(null);
   const [topicReason, setTopicReason] = useState('');
@@ -143,6 +144,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
     setUrl('');
     setLinkNames({});
     setLinkTeachers({});
+    setLinkTopics({});
   }
 
   function change(patch: Partial<TextEdit>) {
@@ -206,14 +208,14 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
     const excluded = feedback.verdict === 'duplicate' || feedback.verdict === 'deferred';
     return <div key={feedback.verdict} className="topic-feedback-record">
       <p><b>已保存 · {topicVerdictLabels[feedback.verdict]}</b> · {feedback.reason}</p>
-      <p className="text-status">{excluded ? '这是处置记录，不参与选题质量学习。'
-        : `适用范围：${feedback.teacher || '未填老师，仅匹配同一回放'} · ${runs.length ? '已带入模型请求并收到回复' : '可作为候选样例，尚无实际调用回执'}`}</p>
-      {!!runs.length && <details><summary>查看学习回执（{runs.length} 次生成）</summary>
+      <p className="text-status">{excluded ? '已记录处置原因，仅供人工查看。'
+        : `适用范围：${feedback.teacher || '未填老师，仅匹配同一回放'} · ${runs.length ? '已作为选题参考发给模型' : '已保存为选题参考，暂无发送记录'}`}</p>
+      {!!runs.length && <details><summary>查看反馈发送记录（{runs.length} 个生成任务）</summary>
         <ul>{runs.map(({ run, receipts }) => <li key={run.id}>
           <b>{run.name || sourceLabel(run)} · {run.teacher || '未填老师'}</b>
           {' · '}{receipts.map(use => `${topicFeedbackStageLabels[use.stage]}（${new Date(use.respondedAt).toLocaleString()}）`).join('、')}
         </li>)}</ul>
-        <p className="text-status">回执确认反馈随请求发送且模型返回了内容，无法证明反馈改变了模型的决定。复用缓存不会生成新回执。</p>
+        <p className="text-status">上面列出发送反馈并收到模型回复的阶段。因反馈跳过的候选可在对应场次的质量复审里查看。</p>
       </details>}
     </div>;
   }
@@ -237,7 +239,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
   const sequence = clip ? readingOrder(clip) : [];
   const running = jobs.filter(item => item.status === 'running').length;
   const links = url.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(pastedLink)
-    .map(input => ({ ...input, name: linkNames[input.url] ?? input.name, teacher: linkTeachers[input.url] }));
+    .map(input => ({ ...input, name: linkNames[input.url] ?? input.name, teacher: linkTeachers[input.url], sessionTopic: linkTopics[input.url] }));
   const teachers = [...new Set([
     ...(learning?.teachers.map(item => item.teacher) ?? []),
     ...accounts.map(account => account.name),
@@ -245,7 +247,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
   ])];
   const recent = jobs.filter(item => item.status !== 'ready');
   const successful = jobs.filter(item => item.status === 'ready');
-  const history = successful.filter(item => [item.name, sourceLabel(item), item.teacher, originalTextSource(item), new Date(item.createdAt).toLocaleDateString(),
+  const history = successful.filter(item => [item.name, item.sessionTopic, sourceLabel(item), item.teacher, originalTextSource(item), new Date(item.createdAt).toLocaleDateString(),
     ...item.clips.flatMap(candidate => [candidate.name, candidate.title])].some(value => value?.toLowerCase().includes(historyQuery.trim().toLowerCase())));
   const filtered = (transcript ?? []).filter(unit => unit.text.includes(textQuery.trim()));
   const pageSize = 60;
@@ -267,6 +269,10 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
         <span>老师</span><input aria-label={`回放 ${i + 1} 老师`} list="text-replay-teachers" maxLength={40}
           placeholder="选填，填了会参考这位老师的经验" value={input.teacher ?? ''}
           onChange={event => setLinkTeachers(previous => ({ ...previous, [input.url]: event.target.value }))} />
+      </label><label className="text-session-topic">
+        <span>本场主题</span><input aria-label={`回放 ${i + 1} 本场主题`} maxLength={120}
+          placeholder="选填，例如：大学专业怎么选" value={input.sessionTopic ?? ''}
+          onChange={event => setLinkTopics(previous => ({ ...previous, [input.url]: event.target.value }))} />
       </label></div>)}</div>}
       <div className="text-import-actions"><button className="button primary" disabled={!links.length || links.length + running > 3 || busy || dirty}>生成文字候选</button>
         <p className="text-status">处理中 {running}/3{links.length + running > 3 ? ' · 超过并行上限' : ''}</p></div>
@@ -332,6 +338,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
     {job && <div className="panel text-panel">
       <div className="text-controls">
         <b>{job.name || sourceLabel(job)}</b>
+        {job.sessionTopic && <span className="text-status">本场主题：{job.sessionTopic}</span>}
         {job.teacher && <span className="text-status">{job.teacher}</span>}
         <button className="button small" disabled={busy || dirty} onClick={() => { setNewName(job.name ?? ''); setNewTeacher(job.teacher ?? ''); }}>修改回放信息</button>
         <button className="button ghost" disabled={busy} onClick={() => void perform(() => window.workbench.openTextSource(job.id))}>打开原回放</button>
@@ -369,7 +376,7 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
         <p className="text-status">每场最多6条进入逐条编稿；复审合格超过6条时先择优，避免逐条生成后再筛。通过表示模型初审，仍需人工审核。</p>
         <ul>{job.qualityAudit.decisions.map((item, i) => <li key={i}><b>{item.round ? item.round + ' · ' : ''}{item.approved ? '通过' : '未通过'} · {item.name}</b>：{item.watchReason && <span>观看价值：{item.watchReason}；</span>}{item.reason}</li>)}</ul>
       </details>}
-      {!!job.topicFeedbackUses?.length && <details><summary>本场学习回执</summary>
+      {!!job.topicFeedbackUses?.length && <details><summary>本场反馈发送记录</summary>
         <ul>{job.topicFeedbackUses.map((use, i) => <li key={i}>{topicFeedbackStageLabels[use.stage]} · 带入 {use.feedback.length} 条手动反馈并收到模型回复 · {new Date(use.respondedAt).toLocaleString()}</li>)}</ul>
       </details>}
       {job.transcriptSavedAt && <p className="text-status">整场原文已保存在本地 · {new Date(job.transcriptSavedAt).toLocaleString()}</p>}
@@ -401,8 +408,8 @@ export function TextSelectionView({ active, accounts = [] }: { active: boolean; 
         <button className="button small" disabled={textPage + 1 >= pages} onClick={() => setTextPage(textPage + 1)}>下一页</button></div>
     </section>}
     {clip && job?.status !== 'running' && <div className="panel text-panel">
-      <details open><summary>选题反馈与学习回执</summary>
-        <p className="text-status">先选「值得做」或「不值得做」，再写原因并保存。</p>
+      <details open><summary>选题反馈</summary>
+        <p className="text-status">写下具体的取舍理由。重选时会跳过你否掉的同场原文，同老师后续选题会核对这些理由。</p>
         <div className="text-controls">
           {(['good', 'bad'] as const).map(verdict => <button type="button" className={`button small${topicVerdict === verdict ? ' primary' : ''}`} key={verdict} disabled={busy}
             aria-pressed={topicVerdict === verdict} onClick={() => { setTopicVerdict(verdict); setTopicReason(qualityFeedback?.verdict === verdict ? qualityFeedback.reason : ''); }}>{topicVerdictLabels[verdict]}</button>)}

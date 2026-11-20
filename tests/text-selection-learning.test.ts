@@ -14,25 +14,25 @@ function sample(teacher: string, id: string, feedback?: 'good' | 'bad'): TextJob
 }
 describe('选题经验必须来自明确的人类反馈', () => {
   it('导出只表示采用事实，不成为明确的选题质量认可', () => {
-    const j = sample('示例讲师甲', 'one');
-    j.deliveries = [{ clipId: 'clip', teacher: '示例讲师甲', title: '已导出', documentId: 'doc' }];
-    const context = buildSelectionLearning([j], sample('示例讲师甲', 'current'));
+    const j = sample('苗老师', 'one');
+    j.deliveries = [{ clipId: 'clip', teacher: '苗老师', title: '已导出', documentId: 'doc' }];
+    const context = buildSelectionLearning([j], sample('苗老师', 'current'));
     expect(context?.selectionFeedback?.teacherExamples).toMatchObject([{ verdict: 'adopted', scope: expect.stringContaining('不是明确质量认可') }]);
   });
   it('同一老师的明确理由可用于同场重生成；不同老师不套用个人偏好', () => {
-    const j = sample('示例讲师甲', 'same', 'bad');
+    const j = sample('苗老师', 'same', 'bad');
     expect(buildSelectionLearning([j], j)?.selectionFeedback?.teacherExamples).toMatchObject([{ verdict: 'bad' }]);
-    expect(buildSelectionLearning([j], sample('示例讲师乙', 'other'))).toBeUndefined();
+    expect(buildSelectionLearning([j], sample('周老师', 'other'))).toBeUndefined();
   });
   it('保留被暂不采用和原话不完整覆盖的旧选题评价，清除反馈后停止引用', () => {
-    const j = sample('示例讲师甲', 'restore', 'good');
+    const j = sample('苗老师', 'restore', 'good');
     const clip = j.clips[0];
     const good = clip.topicFeedback!;
     clip.topicFeedback = { ...good, verdict: 'deferred', reason: '以后做', updatedAt: '2026-11-09' };
     clip.topicFeedbackHistory = [good, clip.topicFeedback];
     const refs = vi.fn();
     expect(buildSelectionLearning([j], j, '', [], refs)?.selectionFeedback?.teacherExamples).toMatchObject([{ verdict: 'good', reason: good.reason }]);
-    expect(refs).toHaveBeenCalledWith([{ jobId: j.id, clipId: clip.id, updatedAt: good.updatedAt }]);
+    expect(refs).toHaveBeenCalledWith([{ jobId: j.id, clipId: clip.id, updatedAt: good.updatedAt }], []);
     clip.topicFeedback = { ...good, verdict: 'incomplete', reason: '没有讲为什么', updatedAt: '2026-11-10' };
     clip.topicFeedbackHistory.push(clip.topicFeedback);
     expect(buildSelectionLearning([j], j)?.selectionFeedback?.teacherExamples).toMatchObject([{ verdict: 'good', completenessNote: '没有讲为什么' }]);
@@ -64,7 +64,8 @@ it('初选和复审都思考，人工反馈前移；同条件复用，新反馈/
         return { decisions: input.candidates.map((c: any) => ({ number: c.number, promise: c.name,
           watchReason: '家长共同遇到名气与就业的真实冲突', valueType: 'decision', watchValue: true, standalone: true, complete: true,
           coreQuestion: '怎么取舍', conclusion: '先看目标', reason: '原文提出冲突并给出判断框架', duplicateOf: null,
-          evidence: [{ id: 'S1', quote: '只看学校名气' }, { id: 'S2', quote: '先看孩子的目标' }] })) };
+          evidence: [{ id: 'S1', quote: '只看学校名气' }, { id: 'S2', quote: '先看孩子的目标' }],
+          feedbackMatch: input.negativeFeedback?.length ? { number: 1, id: 'S2', quote: '先看孩子的目标', explanation: '没有解释怎么用目标做决定' } : null })) };
       }
       if (prompt.startsWith('你负责最终文字选稿')) {
         expect(input.context.selectionLearning.selectionFeedback.teacherExamples).toMatchObject([{ verdict: 'bad' }]);
@@ -74,7 +75,7 @@ it('初选和复审都思考，人工反馈前移；同条件复用，新反馈/
     }) };
   const source = { identify: identifyTextSource, readTranscript: vi.fn(async () => ({ parts: units, cues: true })) };
   const app = new TextWorkbench(db, source, model);
-  const [first] = app.start([{ url: 'https://tingwu.aliyun.com/doc/transcripts/stable', teacher: '示例讲师甲' }]);
+  const [first] = app.start([{ url: 'https://tingwu.aliyun.com/doc/transcripts/stable', teacher: '苗老师' }]);
   await vi.waitFor(() => expect(app.list().find(j => j.id === first.id)?.status).toBe('ready'));
   const second = app.retry(first.id);
   await vi.waitFor(() => expect(app.list().find(j => j.id === second.id)?.status).toBe('ready'));
@@ -88,12 +89,11 @@ it('初选和复审都思考，人工反馈前移；同条件复用，新反馈/
   await vi.waitFor(() => expect(app.list().find(j => j.id === third.id)?.status).toBe('ready'));
   expect(scans()).toHaveLength(2);
   expect(scans().at(-1)?.[1].selectionLearning.selectionFeedback.teacherExamples).toMatchObject([{ verdict: 'bad' }]);
-  const reviewCall = model.textSelection.mock.calls.filter(([p]) => p.startsWith('你是直播短视频选题主编')).at(-1)!;
-  expect(reviewCall[1].selectionLearning.selectionFeedback.teacherExamples).toMatchObject([{ verdict: 'bad' }]);
   const rerun = app.list().find(j => j.id === third.id)!;
   expect(rerun.clips).toHaveLength(0);
-  expect(rerun.topicFeedbackUses?.map(use => use.stage)).toEqual(['scan', 'review', 'final']);
-  expect(rerun.topicFeedbackUses?.at(-1)?.feedback).toMatchObject([{ jobId: first.id, clipId: original.clips[0].id }]);
+  expect(rerun.qualityAudit?.decisions).toMatchObject([{ approved: false, round: '人工反馈', reason: expect.stringContaining('泛泛建议') }]);
+  expect(rerun.topicFeedbackUses?.map(use => use.stage)).toEqual(['scan']);
+  expect(rerun.topicFeedbackUses?.[0].feedback).toMatchObject([{ jobId: first.id, clipId: original.clips[0].id }]);
   const cached = app.retry(first.id);
   await vi.waitFor(() => expect(app.list().find(j => j.id === cached.id)?.status).toBe('ready'));
   expect(app.list().find(j => j.id === cached.id)?.topicFeedbackUses).toBeUndefined();
@@ -101,13 +101,22 @@ it('初选和复审都思考，人工反馈前移；同条件复用，新反馈/
   const fourth = app.retry(first.id);
   await vi.waitFor(() => expect(app.list().find(j => j.id === fourth.id)?.status).toBe('ready'));
   expect(scans()).toHaveLength(3);
+  const [future] = app.start([{ url: 'https://tingwu.aliyun.com/doc/transcripts/next', teacher: '苗老师' }]);
+  await vi.waitFor(() => expect(app.list().find(j => j.id === future.id)?.status).toBe('ready'));
+  const nextReplay = app.list().find(j => j.id === future.id)!;
+  expect(nextReplay.clips).toHaveLength(0);
+  expect(nextReplay.qualityAudit?.decisions).toMatchObject([{ approved: false, round: '人工反馈', reason: expect.stringContaining('先看孩子的目标') }]);
+  expect(nextReplay.topicFeedbackUses?.map(use => use.stage)).toEqual(['scan', 'review']);
+  app.clearTopicFeedback(first.id, original.clips[0].id);
+  const restored = app.retry(first.id);
+  await vi.waitFor(() => expect(app.list().find(j => j.id === restored.id)?.clips).toHaveLength(1));
   expect(original.clips).toHaveLength(1);
 });
 
 it('仅将名称明确匹配的账号规则与样片模式前移，不串用其他老师的账号', () => {
-  const account = { name: '示例讲师甲', audience: '江苏家长', preferenceSummary: '重视真实选择冲突', selectionPrinciples: '观点与故事均可，不能只按分数筛选',
+  const account = { name: '苗老师', audience: '江苏家长', preferenceSummary: '重视真实选择冲突', selectionPrinciples: '观点与故事均可，不能只按分数筛选',
     sampleLearning: { profile: { summary: '先给真实冲突再给理由', audienceSignals: ['家长焦虑'], evidenceSignals: ['具体经历'], hookPatterns: ['反差'], avoidPatterns: ['空泛列表'], recommendationPatterns: [] } } } as any;
-  const context = buildSelectionLearning([], sample('示例讲师甲', 'current'), '', [account]);
-  expect(context?.accountReference).toMatchObject({ teacher: '示例讲师甲', selectionPrinciples: expect.stringContaining('故事'), samplePatterns: { audienceSignals: ['家长焦虑'] } });
-  expect(buildSelectionLearning([], sample('示例讲师乙', 'other'), '', [account])).toBeUndefined();
+  const context = buildSelectionLearning([], sample('苗老师', 'current'), '', [account]);
+  expect(context?.accountReference).toMatchObject({ teacher: '苗老师', selectionPrinciples: expect.stringContaining('故事'), samplePatterns: { audienceSignals: ['家长焦虑'] } });
+  expect(buildSelectionLearning([], sample('周老师', 'other'), '', [account])).toBeUndefined();
 });

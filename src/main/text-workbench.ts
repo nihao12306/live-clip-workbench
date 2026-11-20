@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { qualityPrompt, screenTextCandidates } from './text-quality-gate';
+import { qualityPrompt, screenTextCandidates, type QualityCandidate } from './text-quality-gate';
 import { editRanges, originalTextSource, readingOrder } from '../shared/text-selection';
 import type { TextClip, TextEdit, TextJob, TextJobInput, TextPick, TextRange, TextUnit, TextTopicVerdict, TopicFeedbackRef, TopicFeedbackStage } from '../shared/text-selection';
 import type { DatabaseService } from './database';
@@ -8,12 +8,13 @@ import type { DeepSeekModelAdapter } from './model-adapter';
 import type { TextSources } from './text-sources';
 import { chooseTopSix, MAX_TEXT_CANDIDATES } from './text-candidate-limit';
 import { finalVersionMatches } from '../shared/text-behavior';
-import { buildSelectionLearning } from './text-selection-learning';
-import { buildTextLearning, editSnapshot } from './text-learning';
+import { buildSelectionLearning, type RejectedTopicSpan } from './text-selection-learning';
+import { buildTextLearning, confirmedTextLearningSamples, editSnapshot, type TextLearningSample } from './text-learning';
 import type { TextFeishuExport } from '../shared/types';
 
 const key = 'text-selection-jobs-v1';
 const pendingKey = 'text-selection-pending-v1';
+const retainedLearningKey = 'text-confirmed-learning-retained-v1';
 const candidateRangeError = '模型返回了无效的候选起止位置';
 type SourceCache = { savedAt: string; units: TextUnit[] };
 
@@ -23,8 +24,15 @@ function sourceCacheKey(url: string) {
   return 'text-source-cache:' + createHash('sha256').update(source.href).digest('hex');
 }
 const candidateSchema = z.object({ name: z.string().min(1), startId: z.string(), endId: z.string(),
-  topicValue: z.string().min(1), completeness: z.string().min(1) });
-type Candidate = z.infer<typeof candidateSchema>;
+  topicValue: z.string().min(1), completeness: z.string().min(1), unitIds: z.array(z.string()).min(1).max(150).optional() });
+type Candidate = z.infer<typeof candidateSchema> & Pick<QualityCandidate, 'crossSpan'>;
+const crossSpanRequestSchema = z.object({
+  startId: z.string(), endId: z.string(),
+  reason: z.enum(['missing', 'betterTogether']),
+  value: z.string().trim().min(1), gap: z.string().trim().min(1),
+});
+const crossSpanScanInstruction = `sessionTopic 是用户填写的本场主题，留空就自然选题。主题只给相关好题一点优先，其他好题也能入选。candidates 只用本段及邻近连续原话，优先把必要前提、理由、结论在附近找齐。另可返回 crossSpanRequests，每项为 {"startId":"本段起点","endId":"本段末尾","reason":"missing或betterTogether","value":"为什么该账号家长值得点开","gap":"本段缺失的具体解释、条件、证据或结论，或同一问题在远处表达能带来的明确增益"}。只给明显值得做的题，且本段和紧邻原话仍无法补齐，或有明确线索表明远处同一问题能显著改善成片才申请；本段已讲清的日常候选照常提名。另可返回 supportUnitIds，最多36个原话编号，集中留存可能补全优质升学题的具体条件、论据、例子和结论，覆盖主题内外。没有可以省略。不准仅凭主题或关键词申请跨段。`;
+const crossSpanAssemblyPrompt = `你是直播切片编辑。逐项阅读 anchors 中已经判断为高价值的具体问题、附近原话及缺口，再查 supportUnits。只有远处原话实际补齐该缺口，或确实在回答同一个具体问题并显著改善成片，才返回组合。先检查附近原话，如果已能讲清，优先留在附近。若附近能讲清而仅需调整顺序，省略该项。一个关键词、一个大主题、泛泛的附和或重复观点都不算。核对主体、适用条件和时间口径，实际拼读一遍；禁止补写、拼出新结论或另起题。每个 anchor 最多一项，不合适可省略。返回 JSON {"candidates":[{"anchor":1,"name":"原题","startId":"首句编号","endId":"末句编号","unitIds":["原话编号"],"topicValue":"观看价值","completeness":"远处新增的原话怎样补齐或改善","support":{"id":"远处原话编号","quote":"连续逐字原话"}}]}。unitIds 按原文顺序，不能重复。`;
 const quotation = z.object({ id: z.string(), keep: z.array(z.string().min(1)).min(1).optional() });
 const modelPlan = z.object({ titles: z.array(z.object({ text: z.string().trim().min(1) })).min(1).max(4),
   hooks: z.array(quotation).min(1).max(3), selectedHook: z.number().int().nonnegative(),
@@ -37,11 +45,13 @@ const editSchema = z.object({ title: z.string().trim().min(1).max(200), hook: pi
   repeatHook: z.boolean(), body: z.array(pickSchema).max(1500) });
 
 export const scanPrompt = `你是直播短视频选题编辑，输入只是本场原文。先找观众为什么想看、为什么看下去，再检查原话能否兑现这个承诺。信息完整只是可用底线，不是好选题的充分理由。
+先找当前账号目标家长普遍关心的升学问题；省内规则可服务省内账号，全国账号优先能跨省使用的判断。具体案例可提供证据，不必把所有个案条件塞进标题。按老师账号规则与明确反馈取舍，不根据其他老师猜测当前账号偏好。
 优先发现：受众共同困惑中的真实取舍、与常识冲突但有依据的判断、能让人代入的具体故事或情绪、有解释力的洞察、能改变决策的实用信息。题材可以是观点、故事、答疑、比较、盘点或政策解释，不能固定偏好“多少分报哪个学校”，也不能因它是答疑、常见题或单一结论就直接淘汰。提名理由必须说清受众、观看动机及本场最有价值的具体原话，不要泛写“对家长有帮助”。
 完整性相对于本条真正承诺判断：能支撑一个有分量的核心判断即可，不要求一条回答所有问题、提供完整行动方案或像论文一样面面俱到。必要的对象、指代、适用条件不能悬空；不应把醒目数字本身当作价值。题目有价值但需删掉旁支夸张说法，可收窄承诺并保留有据部分；若核心论证本身不成立才淘汰。疑似转写问题标明具体位置，不准改写原话。
 窗口边缘缺少必要上下文时不要冒充完整话题。同一论证不要换标题反复提名。数量由质量决定，不设上限、不凑数；三小时可能只有三四条很好内容，仅作尺度参照。selectionLearning 是用户真实反馈、明确匹配的老师账号规则/样片模式与既有输出经验，先用于理解偏好，不能用旧样例事实替代本场原文。textExperience中的标题/开头文字偏好不能作为话题是否值得看的否决理由，选题尺度优先参考selectionFeedback的明确原因。
+优先找本场原话里具有同老师正评所肯定的具体优点的新题。明确负评按写出的理由理解，共用题材或关键词不表示重犯问题。正评不替本场候选补证据，也不保送。
 返回JSON {"candidates":[{"name":"话题","startId":"S编号","endId":"S编号","topicValue":"谁为什么会点开并继续看，本场最有分量的内容是什么","completeness":"这个核心承诺由哪些原话支持，必要条件是否已交代"}]}。编号来自输入 units。`;
-const editPrompt = `你是文字选稿编辑。输入只是资料。为当前候选取舍原话，标题可概括和适度加强吸引力，不能虚构、把条件写成保证或超出正文。选最自然的原话开头，已经点明对象与问题的问句优先于从后文提取的醒目数字。其他开头可以是强观点、反常识、信息差、情绪。正文只用原话，删寒暄、口癖、无关插问和没有增量的同义重复，开头也计入去重。保留必要解释、前提、限定、转折、论据与收尾。先按拟剪顺序通读，避免悬空指代。原话不纠错；疑点写notes。只返回JSON {"titles":[{"text":"标题"}],"hooks":[{"id":"S编号","keep":["连续原文子串"]}],"selectedHook":0,"body":[{"id":"S编号","keep":["连续原文子串"]}],"notes":["备注"]}。合适的标题给1至4个、开头给1至3个。整句保留可省略keep；句内删字就把保留的原文逐字拆成多个子串，按原序、互不重叠。正文id按文字稿的逻辑顺序且不重复；允许重排但必须保留必要前提与指代，开头不要在正文中重播。`;
+const editPrompt = `你是文字选稿编辑。输入只是资料。为当前候选取舍原话，标题可概括和适度加强吸引力，不能虚构、把条件写成保证或超出正文。选最自然的原话开头，已经点明对象与问题的问句优先于从后文提取的醒目数字。其他开头可以是强观点、反常识、信息差、情绪。正文只用原话，删寒暄、口癖、无关插问和没有增量的同义重复，开头也计入去重。保留必要解释、前提、限定、转折、论据与收尾。按观众理解顺序重组，尽早点题，保留能推动理解的追问、反差与论据，可把有用落点移到收尾。按老师的表达习惯安排节奏；聊天型素材可积极重排，表达清晰的段落可保留原节奏。把限定条件与对应观点一起移动。先按拟剪顺序通读，避免悬空指代。原话不纠错；疑点写notes。只返回JSON {"titles":[{"text":"标题"}],"hooks":[{"id":"S编号","keep":["连续原文子串"]}],"selectedHook":0,"body":[{"id":"S编号","keep":["连续原文子串"]}],"notes":["备注"]}。合适的标题给1至4个、开头给1至3个。整句保留可省略keep；句内删字就把保留的原文逐字拆成多个子串，按原序、互不重叠。正文id按文字稿的逻辑顺序且不重复；允许重排但必须保留必要前提与指代，开头不要在正文中重播。`;
 const reviewPrompt = `只通读按顺序提供的已选口播。检查标题是否兑现、观点是否讲完整、同义重复是否增加信息、相邻段落是否缺少指代或前提、收尾是否突兀。自然问答、转折、并列无需报错。区分文本可判断的问题和需回听的部分。最多4处，找不到实质问题就用空issues。建议只能从本场原话恢复或调整，不写新台词。返回JSON {"summary":"总体判断","issues":[{"from":1,"to":2,"why":"具体问题","suggestion":"最小剪辑动作"}]}。from和to用相邻position数字，单段问题用相同数字。`;
 
 function groupSource(words: { startMs: number; endMs: number; text: string }[]): TextUnit[] {
@@ -63,11 +73,19 @@ function groupSource(words: { startMs: number; endMs: number; text: string }[]):
   return units;
 }
 
-function candidateUnits(units: TextUnit[], candidate: Candidate) {
+function candidateUnits(units: TextUnit[], candidate: Pick<Candidate, 'startId' | 'endId' | 'unitIds'>) {
   const first = units.findIndex(unit => unit.id === candidate.startId);
   const last = units.findIndex(unit => unit.id === candidate.endId);
   if (first < 0 || last < first) throw new Error(candidateRangeError);
-  return units.slice(first, last + 1);
+  const contiguous = units.slice(first, last + 1);
+  if (!candidate.unitIds) return contiguous;
+  const selected = new Set(candidate.unitIds);
+  const kept = contiguous.filter(unit => selected.has(unit.id));
+  if (kept.length !== candidate.unitIds.length || kept[0]?.id !== candidate.startId
+    || kept.at(-1)?.id !== candidate.endId || kept.some((unit, i) => unit.id !== candidate.unitIds![i])) {
+    throw new Error(candidateRangeError);
+  }
+  return kept;
 }
 
 function resolveQuote(quote: z.infer<typeof quotation>, units: Map<string, TextUnit>): TextPick {
@@ -181,7 +199,7 @@ export class TextWorkbench {
     if (subtitleFile && inputs.length !== 1) throw new Error('每个字幕文件只对应一场直播');
     const sources = inputs.map(input => {
       const originalUrl = input.url.trim();
-      return { ...this.source.identify(originalUrl), originalUrl, name: this.cleanName(input.name), teacher: this.cleanTeacher(input.teacher) };
+      return { ...this.source.identify(originalUrl), originalUrl, name: this.cleanName(input.name), teacher: this.cleanTeacher(input.teacher), sessionTopic: this.cleanSessionTopic(input.sessionTopic) };
     });
     const activeUrls = new Set([...this.current.values()].filter(job => this.active.has(job.id)).map(job => job.url));
     for (const source of sources) {
@@ -193,7 +211,7 @@ export class TextWorkbench {
         if (previous.status === 'failed' && previous.url === source.url) this.dismiss(previous.id);
       }
       return this.launch({ id: randomUUID(), url: source.url, originalUrl: source.originalUrl, name: source.name,
-        source: source.kind, teacher: source.teacher, createdAt: new Date().toISOString(), status: 'running', message: '', clips: [] }, subtitleFile);
+        source: source.kind, teacher: source.teacher, sessionTopic: source.sessionTopic, createdAt: new Date().toISOString(), status: 'running', message: '', clips: [] }, subtitleFile);
     });
   }
 
@@ -233,6 +251,12 @@ export class TextWorkbench {
     return name || undefined;
   }
 
+  private cleanSessionTopic(input?: string) {
+    const value = input?.trim();
+    if (value && (value.length > 120 || /[\r\n]/.test(value))) throw new Error('本场主题请填写一行，最多 120 字');
+    return value || undefined;
+  }
+
   private cleanTeacher(input?: string) {
     const teacher = input?.trim().normalize();
     if (teacher && (teacher.length > 40 || /[\r\n\t]/.test(teacher))) throw new Error('老师姓名请填写一行，最多 40 字');
@@ -259,7 +283,7 @@ export class TextWorkbench {
     this.savePending();
   }
 
-  delete(jobId: string): void {
+  delete(jobId: string, removeLearning = false): void {
     const job = this.find(jobId);
     if (job.status === 'running' || this.active.has(jobId) || this.pendingTranscripts.has(jobId)) {
       throw new Error('这场直播正在处理，请完成后再删除');
@@ -271,7 +295,9 @@ export class TextWorkbench {
     if (!this.list().some(other => other.id !== jobId && sourceCacheKey(other.url) === sourceKey)) {
       removedKeys.push(sourceKey);
     }
+    const samples = removeLearning ? [] : confirmedTextLearningSamples(job);
     this.database.replaceAndRemoveSettings({
+      ...(samples.length ? { [retainedLearningKey]: [...this.retainedLearning(), ...samples] } : {}),
       [key]: this.stored().filter(item => item.id !== jobId),
       [pendingKey]: this.pendingJobs(jobId),
     }, removedKeys);
@@ -283,7 +309,7 @@ export class TextWorkbench {
   retry(jobId: string, subtitleFile?: string) {
     const job = this.find(jobId);
     if (job.status === 'running') throw new Error('请先等待这场直播处理完成');
-    if (job.status === 'ready') return this.start([{ url: originalTextSource(job), name: job.name, teacher: job.teacher }], subtitleFile)[0];
+    if (job.status === 'ready') return this.start([{ url: originalTextSource(job), name: job.name, teacher: job.teacher, sessionTopic: job.sessionTopic }], subtitleFile)[0];
     if (this.active.size >= 3) throw new Error('最多同时处理 3 场，请等一场完成后重试');
     return this.launch(job, subtitleFile);
   }
@@ -387,7 +413,11 @@ export class TextWorkbench {
       error ? { ...delivery, syncError: error } : { ...delivery, title, syncedAt: new Date().toISOString(), syncError: undefined }) });
   }
 
-  learningSummary() { return buildTextLearning(this.list()).summary; }
+  private retainedLearning() {
+    return this.database.getSetting<TextLearningSample[]>(retainedLearningKey, []);
+  }
+
+  learningSummary() { return buildTextLearning(this.list(), undefined, '', this.retainedLearning()).summary; }
 
   private async run(job: TextJob) {
     let units = this.currentTranscripts.get(job.id)
@@ -405,7 +435,11 @@ export class TextWorkbench {
     }
     job.transcriptCount = units.length;
     let feedback: TopicFeedbackRef[] = [];
-    const selectionLearning = buildSelectionLearning(this.stored(), job, '', this.database.listAccounts?.() ?? [], refs => { feedback = refs; });
+    let rejectedSpans: RejectedTopicSpan[] = [];
+    const selectionLearning = buildSelectionLearning(this.stored(), job, job.sessionTopic ?? '', this.database.listAccounts?.() ?? [], (refs, spans) => {
+      feedback = refs;
+      rejectedSpans = spans;
+    }, this.retainedLearning());
     const select = async (stage: TopicFeedbackStage, prompt: string, input: unknown, effort: 'low' | 'high' = 'high') => {
       const result = await this.model.textSelection(prompt, input, 'analysis', effort);
       if (feedback.length && !job.topicFeedbackUses?.some(use => use.stage === stage && JSON.stringify(use.feedback) === JSON.stringify(feedback))) {
@@ -414,17 +448,17 @@ export class TextWorkbench {
       }
       return result;
     };
-    const qualified = await this.chooseCandidates(job, units, selectionLearning, select);
-    if (qualified.length > MAX_TEXT_CANDIDATES || qualified.length && feedback.length) {
+    const qualified = await this.chooseCandidates(job, units, selectionLearning, rejectedSpans, select);
+    if (qualified.length > MAX_TEXT_CANDIDATES || qualified.length && (feedback.length || job.sessionTopic)) {
       job.message = '正在从合格话题中择优，最多生成6条文字初稿';
       this.persist(job);
     }
     const rankingContext = { teacher: job.teacher, model: await this.model.getSelectionIdentity?.(),
-      selectionLearning };
+      selectionLearning, sessionTopic: job.sessionTopic };
     const candidates = (await chooseTopSix(qualified, (prompt, input) => select('final', prompt, input), {
       get: hash => this.database.getSetting('text-top-six:' + hash, undefined),
       set: (hash, value) => this.database.setSetting('text-top-six:' + hash, value),
-    }, rankingContext, feedback.length > 0)).slice(0, MAX_TEXT_CANDIDATES);
+    }, rankingContext, feedback.length > 0 || Boolean(job.sessionTopic))).slice(0, MAX_TEXT_CANDIDATES);
     if (job.qualityAudit) job.qualityAudit = { ...job.qualityAudit, qualified: qualified.length, approved: candidates.length, outputLimit: MAX_TEXT_CANDIDATES };
     const failures: string[] = [];
     job.failureStage = '整理候选';
@@ -441,16 +475,17 @@ export class TextWorkbench {
     job.status = failures.length && !job.clips.length ? 'failed' : 'ready';
     if (job.status === 'ready') delete job.failureStage;
     job.message = job.clips.length ? `已生成 ${job.clips.length} 条候选${failures.length ? `，${failures.length} 条未通过原话校验` : ''}`
-      : failures.length ? `候选处理未完成：${failures.join('；')}` : qualified.length ? '最终择优未保留候选，整场原文已保留' : '本场提名未通过严格质量复审，未继续逐条编稿；整场原文已保留';
+      : failures.length ? `候选处理未完成：${failures.join('；')}` : qualified.length ? '最终择优未保留候选，整场原文已保留' : '本场筛选未保留候选，整场原文已保留，可查看质量复审原因';
     this.persist(job);
     if (job.status === 'failed') this.savePending();
   }
 
   private async chooseCandidates(job: TextJob, units: TextUnit[], selectionLearning: ReturnType<typeof buildSelectionLearning>,
+    rejectedSpans: RejectedTopicSpan[],
     select: (stage: TopicFeedbackStage, prompt: string, input: unknown, effort?: 'low' | 'high') => Promise<unknown>): Promise<Candidate[]> {
     const modelIdentity = await this.model.getSelectionIdentity?.() ?? { model: 'test-model', baseUrl: '' };
-    const fingerprint = createHash('sha256').update(JSON.stringify({ policy: 'audience-value-v2', scanPrompt, qualityPrompt,
-      units, source: new URL(job.url).origin + new URL(job.url).pathname, teacher: job.teacher?.trim().normalize() ?? '', selectionLearning, modelIdentity, thinking: 'scan-low-review-high' })).digest('hex');
+    const fingerprint = createHash('sha256').update(JSON.stringify({ policy: 'audience-value-v5', scanPrompt, qualityPrompt, sessionTopic: job.sessionTopic, crossSpanScanInstruction, crossSpanAssemblyPrompt,
+      units, source: sourceCacheKey(job.url), teacher: job.teacher?.trim().normalize() ?? '', selectionLearning, rejectedSpans, modelIdentity, thinking: 'scan-low-review-high' })).digest('hex');
     const checkpointKey = 'text-selection-cache:' + fingerprint;
     const checkpoint = this.database.getSetting<{ fingerprint: string; candidates: Candidate[]; audit: NonNullable<TextJob['qualityAudit']> } | undefined>(checkpointKey, undefined);
     if (checkpoint?.fingerprint === fingerprint) {
@@ -464,30 +499,108 @@ export class TextWorkbench {
     const windows = duration <= 45 * 60000 ? [units] : Array.from({ length: Math.ceil(duration / size) }, (_, i) =>
       units.filter(unit => unit.endMs >= i * size - overlap && unit.startMs < (i + 1) * size + overlap)).filter(window => window.length);
     const shortlist: Candidate[] = [];
+    type CrossSpanRequest = z.infer<typeof crossSpanRequestSchema>;
+    const requests: CrossSpanRequest[] = [];
+    const supportIds = new Set<string>();
+    const scanResult = z.object({
+      candidates: z.array(candidateSchema.omit({ unitIds: true })),
+      crossSpanRequests: z.array(crossSpanRequestSchema).max(4).optional(),
+      supportUnitIds: z.array(z.string()).max(36).optional(),
+    });
     for (let i = 0; i < windows.length; i++) {
       job.message = `正在筛选话题 · 已扫描 ${i}/${windows.length} 段`;
       this.persist(job);
       const window = windows[i];
       const scanKey = `text-scan-checkpoint:${fingerprint}:${i}`;
-      const candidates = this.database.getSetting<Candidate[] | undefined>(scanKey, undefined)
-        ?? await this.validatedSelection(job, scanPrompt, { units: window, selectionLearning }, raw => {
-        const items = z.object({ candidates: z.array(candidateSchema) }).parse(raw).candidates;
-        for (const candidate of items) candidateUnits(window, candidate);
-        return items;
-      }, (prompt, input, effort) => select('scan', prompt, input, effort));
-      this.database.setSetting(scanKey, candidates);
-      shortlist.push(...candidates);
+      const result = this.database.getSetting<z.infer<typeof scanResult> | undefined>(scanKey, undefined)
+        ?? await this.validatedSelection(job, scanPrompt + '\n' + crossSpanScanInstruction,
+          { units: window, selectionLearning, sessionTopic: job.sessionTopic }, raw => {
+            const parsed = scanResult.parse(raw);
+            for (const candidate of [...parsed.candidates, ...parsed.crossSpanRequests ?? []]) candidateUnits(window, candidate);
+            const ids = new Set(window.map(unit => unit.id));
+            if (parsed.supportUnitIds?.some(id => !ids.has(id))) throw new Error(candidateRangeError);
+            return parsed;
+          }, (prompt, input, effort) => select('scan', prompt, input, effort));
+      this.database.setSetting(scanKey, result);
+      shortlist.push(...result.candidates);
+      requests.push(...result.crossSpanRequests ?? []);
+      for (const id of result.supportUnitIds ?? []) supportIds.add(id);
     }
 
-    const screened = await screenTextCandidates(shortlist, units,
+    const positions = new Map(units.map((unit, i) => [unit.id, i]));
+    const uniqueRequests = new Map(requests.map(request => [`${request.startId}:${request.endId}`, request]));
+    const anchors = [...uniqueRequests.values()].slice(0, MAX_TEXT_CANDIDATES).map((request, i) => {
+      const first = positions.get(request.startId)!;
+      const last = positions.get(request.endId)!;
+      const startMs = units[first].startMs;
+      const endMs = units[last].endMs;
+      const nearbyUnits = units.slice(Math.max(0, first - 8), last + 9)
+        .filter(unit => unit.endMs >= startMs - 60000 && unit.startMs <= endMs + 60000);
+      return { ...request, number: i + 1, units: nearbyUnits };
+    });
+    const assemblyNotes: NonNullable<TextJob['qualityAudit']>['decisions'] = [];
+    if (anchors.length && supportIds.size) {
+      job.message = '正在查找能补全优质话题的原话';
+      this.persist(job);
+      const assemblyKey = `text-cross-span:${fingerprint}`;
+      try {
+        const assembled = this.database.getSetting<Candidate[] | undefined>(assemblyKey, undefined)
+          ?? await this.validatedSelection(job, crossSpanAssemblyPrompt, {
+            anchors, supportUnits: units.filter(unit => supportIds.has(unit.id)), selectionLearning,
+          }, raw => {
+            const schema = candidateSchema.required({ unitIds: true }).extend({
+              anchor: z.number().int().min(1).max(anchors.length),
+              support: z.object({ id: z.string(), quote: z.string().trim().min(1) }),
+            });
+            const { candidates } = z.object({ candidates: z.array(schema).max(anchors.length) }).parse(raw);
+            const used = new Set<number>();
+            return candidates.map(({ anchor: number, support, ...candidate }) => {
+              const anchor = anchors[number - 1];
+              const nearby = new Set(anchor.units.map(unit => unit.id));
+              const kept = candidateUnits(units, candidate);
+              const evidence = kept.find(unit => unit.id === support.id);
+              const start = units[positions.get(anchor.startId)!].startMs;
+              const end = units[positions.get(anchor.endId)!].endMs;
+              // Nearby sentences belong to the original passage, even across scan windows.
+              const remote = evidence && (end + 60000 < evidence.startMs || evidence.endMs + 60000 < start);
+              if (used.has(number) || !evidence?.text.includes(support.quote) || !remote || nearby.has(support.id)
+                || kept.some(unit => !nearby.has(unit.id) && !supportIds.has(unit.id))
+                || !kept.some(unit => unit.startMs >= start && unit.endMs <= end)) throw new Error(candidateRangeError);
+              used.add(number);
+              return { ...candidate, crossSpan: { reason: anchor.reason, value: anchor.value, gap: anchor.gap, support } };
+            });
+          }, (prompt, input) => select('scan', prompt, input));
+        this.database.setSetting(assemblyKey, assembled);
+        shortlist.push(...assembled);
+      } catch {
+        // Cross-span suggestions are optional. Completed local scans can still be reviewed.
+        assemblyNotes.push({
+          name: '跨段补充', approved: false, round: '跨段补充',
+          reason: '跨段补充未能完成，已跳过本轮跨段组合，继续复审本段能讲清的候选。',
+        });
+      }
+    }
+
+    const unitsById = new Map(units.map(unit => [unit.id, unit]));
+    const blocked: NonNullable<TextJob['qualityAudit']>['decisions'] = [];
+    const eligible = shortlist.filter(candidate => {
+      const rejected = rejectedSpans.find(span => span.startMs === unitsById.get(candidate.startId)?.startMs
+        && span.endMs === unitsById.get(candidate.endId)?.endMs
+        && (!span.unitIds || span.unitIds.join(',') === candidateUnits(units, candidate).map(unit => unit.id).join(',')));
+      if (!rejected) return true;
+      blocked.push({ name: candidate.name, approved: false, round: '人工反馈', reason: `这段原文已被你标记为不适合成片，原因是「${rejected.reason}」` });
+      return false;
+    });
+    const negativeExamples = selectionLearning?.selectionFeedback?.teacherExamples.filter(sample => sample.verdict === 'bad') ?? [];
+    const screened = await screenTextCandidates(eligible, units,
       (prompt, input) => select('review', prompt, input),
       message => { job.message = message; this.persist(job); }, {
         get: hash => this.database.getSetting(`text-quality-batch:${fingerprint}:${hash}`, undefined)
           ?? this.database.getSetting(`text-quality-batch:${job.id}:${hash}`, undefined),
         set: (hash, value) => this.database.setSetting(`text-quality-batch:${fingerprint}:${hash}`, value),
-      }, selectionLearning);
+      }, selectionLearning, negativeExamples);
     job.qualityAudit = { proposed: shortlist.length, approved: screened.candidates.length,
-      extraReview: screened.extraReview, policyVersion: 'audience-value-v2', model: modelIdentity.model, thinking: '初选低强度思考 · 复审高强度思考', decisions: screened.decisions };
+      extraReview: screened.extraReview, policyVersion: 'audience-value-v5', model: modelIdentity.model, thinking: '初选低强度思考 · 复审高强度思考', decisions: [...assemblyNotes, ...blocked, ...screened.decisions] };
     this.database.setSetting(checkpointKey, { fingerprint, candidates: screened.candidates, audit: job.qualityAudit });
     this.persist(job);
     return screened.candidates;
@@ -518,8 +631,8 @@ export class TextWorkbench {
 
   private async selectClip(candidate: Candidate, units: TextUnit[], job: TextJob): Promise<TextClip> {
     const map = new Map(units.map(unit => [unit.id, unit]));
-    const editorialLearning = buildTextLearning(this.stored(), job, candidate.name).context;
-    const learnedSelection = buildSelectionLearning(this.stored(), job, candidate.name, this.database.listAccounts?.() ?? []);
+    const editorialLearning = buildTextLearning(this.stored(), job, candidate.name, this.retainedLearning()).context;
+    const learnedSelection = buildSelectionLearning(this.stored(), job, candidate.name, this.database.listAccounts?.() ?? [], undefined, this.retainedLearning());
     const selectionLearning = learnedSelection && (learnedSelection.selectionFeedback || learnedSelection.accountReference)
       ? { selectionFeedback: learnedSelection.selectionFeedback, accountReference: learnedSelection.accountReference } : undefined;
     let feedback: string | undefined;
