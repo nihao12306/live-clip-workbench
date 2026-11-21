@@ -1,0 +1,127 @@
+name: Add an Intel Mac installer to an existing release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to supplement
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-intel-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  mac:
+    name: macOS Intel x64
+    runs-on: macos-15-intel
+    timeout-minutes: 35
+    env:
+      TARGET_ARCH: x64
+      MACH_ARCH: x86_64
+      TAG: ${{ inputs.tag }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ inputs.tag }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Build disk image
+        run: |
+          set -euo pipefail
+          test "$TAG" = "v$(node -p 'require("./package.json").version')"
+          FFMPEG_BIN=/usr/bin/true npm ci
+          for tool in meson ninja nasm pkg-config; do
+            command -v "$tool" >/dev/null || brew install "$tool"
+          done
+          bash .github/scripts/build-media-tools.sh
+          test "$(node -p process.arch)" = "$TARGET_ARCH"
+          npm run build
+          npx --no-install electron-builder --mac dmg --"$TARGET_ARCH" --publish never
+      - name: Verify disk image and launch the packaged app
+        run: |
+          set -euo pipefail
+          dmg=(release/*-mac-"$TARGET_ARCH".dmg)
+          test "${#dmg[@]}" = 1
+          hdiutil verify "${dmg[0]}"
+          mount_dir="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "${dmg[0]}"
+          trap 'hdiutil detach "$mount_dir"' EXIT
+          app=("$mount_dir"/*.app)
+          test "${#app[@]}" = 1
+          executable="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "${app[0]}/Contents/Info.plist")"
+          test "$(lipo -archs "${app[0]}/Contents/MacOS/$executable")" = "$MACH_ARCH"
+          resources="${app[0]}/Contents/Resources/app.asar.unpacked/node_modules"
+          ffmpeg="$resources/ffmpeg-static/ffmpeg"
+          ffprobe="$resources/ffprobe-static/bin/darwin/$TARGET_ARCH/ffprobe"
+          for tool in "$ffmpeg" "$ffprobe"; do
+            test "$(lipo -archs "$tool")" = "$MACH_ARCH"
+            "$tool" -buildconf > release/media-build.txt 2>&1
+            if grep -q -- '--enable-nonfree' release/media-build.txt; then exit 1; fi
+            otool -L "$tool" | tail -n +2 | awk '$1 !~ /^\/(usr\/lib|System\/Library)\// { bad = 1 } END { exit bad }'
+          done
+          test -s "$resources/../media-tools/ffmpeg-corresponding-source.tar.gz"
+          "$ffmpeg" -v error -f lavfi -i color=size=160x120:rate=25 -t 1 -c:v libx264 release/media-test.mp4
+          "$ffprobe" -v error -show_entries stream=codec_name -of csv=p=0 release/media-test.mp4 | grep -qx h264
+          "$ffmpeg" -filters > release/media-filters.txt 2>&1
+          grep -qw subtitles release/media-filters.txt
+          grep -qw drawtext release/media-filters.txt
+          python3 -c 'import subprocess,sys; p=subprocess.run([sys.argv[1], "--smoke-test", "--screenshot=release/mac-smoke.png"], capture_output=True, text=True, timeout=45); print(p.stdout); print(p.stderr, file=sys.stderr); sys.exit(0 if p.returncode == 0 and "SMOKE_TEST_READY" in p.stdout else 1)' "${app[0]}/Contents/MacOS/$executable"
+          test -s release/mac-smoke.png
+          (cd release && shasum -a 256 *-mac-"$TARGET_ARCH".dmg > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mac-release-x64
+          path: |
+            release/*-mac-x64.dmg
+            release/SHA256SUMS.txt
+            release/mac-smoke.png
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish verified Intel installer
+    needs: mac
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: mac-release-x64
+      - name: Add Intel installer to the existing release
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          sha256sum -c SHA256SUMS.txt
+          file="live-clip-workbench-${TAG#v}-mac-x64.dmg"
+          release="repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
+          test "$(gh api "$release" --jq '.draft or .prerelease')" = false
+          filter=".assets[] | select(.name == \"$file\" and .state == \"uploaded\") | .digest"
+          actual="$(gh api "$release" --jq "$filter")"
+          if [ -z "$actual" ]; then
+            gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY"
+            actual="$(gh api "$release" --jq "$filter")"
+          fi
+          test "$actual" = "sha256:$(sha256sum "$file" | cut -d' ' -f1)"
+          gh api "$release" --jq .body > current-notes.md
+          if ! grep -Fq 'Intel 芯片 Mac 下载 x64 DMG' current-notes.md; then
+            printf '\n补充：Intel 芯片 Mac 下载 x64 DMG，将工作台拖入「应用程序」。\n' >> current-notes.md
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file current-notes.md
+          fi
